@@ -125,12 +125,6 @@ jobs:
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v4
 
-            - name: Login to Docker Hub
-              uses: docker/login-action@v4.6.0
-              with:
-                  username: ${{ secrets.DOCKERHUB_USERNAME }}
-                  password: ${{ secrets.DOCKERHUB_TOKEN }}
-
             - name: Login to GitHub Container Registry
               uses: docker/login-action@v4.6.0
               with:
@@ -146,7 +140,6 @@ jobs:
                   push: true
                   file: ./Dockerfile
                   tags: |
-                      ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ matrix.arch }}
                       ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ matrix.arch }}
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
@@ -155,12 +148,6 @@ jobs:
         needs: [build-images]
         runs-on: ubuntu-latest
         steps:
-            - name: Login to Docker Hub
-              uses: docker/login-action@v4.6.0
-              with:
-                  username: ${{ secrets.DOCKERHUB_USERNAME }}
-                  password: ${{ secrets.DOCKERHUB_TOKEN }}
-
             - name: Login to GitHub Container Registry
               uses: docker/login-action@v4.6.0
               with:
@@ -171,14 +158,6 @@ jobs:
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v4
 
-            - name: Create tagged manifest
-              run: |
-                  docker buildx imagetools create \
-                    -t "${{ env.IMAGE_NAME }}:${{ github.ref_name }}" \
-                    "${{ env.IMAGE_NAME }}:${{ github.ref_name }}-amd64" \
-                    "${{ env.IMAGE_NAME }}:${{ github.ref_name }}-arm64"
-                  docker buildx imagetools inspect "${{ env.IMAGE_NAME }}:${{ github.ref_name }}"
-
             - name: Create tagged manifest for GitHub
               run: |
                   docker buildx imagetools create \
@@ -186,15 +165,6 @@ jobs:
                     "ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-amd64" \
                     "ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-arm64"
                   docker buildx imagetools inspect "ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}"
-
-            - name: Create latest manifest if not prerelease
-              if: ${{ github.event_name == 'release' && github.event.release.prerelease != true }}
-              run: |
-                  docker buildx imagetools create \
-                    -t "${{ env.IMAGE_NAME }}:latest" \
-                    "${{ env.IMAGE_NAME }}:${{ github.ref_name }}-amd64" \
-                    "${{ env.IMAGE_NAME }}:${{ github.ref_name }}-arm64"
-                  docker buildx imagetools inspect "${{ env.IMAGE_NAME }}:latest"
 
             - name: Create latest manifest for GitHub if not prerelease
               if: ${{ github.event_name == 'release' && github.event.release.prerelease != true }}
@@ -204,3 +174,4 @@ jobs:
                     "ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-amd64" \
                     "ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}-arm64"
                   docker buildx imagetools inspect "ghcr.io/${{ env.IMAGE_NAME }}:latest"
+
