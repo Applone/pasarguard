@@ -2,7 +2,7 @@ import re
 from enum import Enum, StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from app.models.proxy import ShadowsocksMethods
 
@@ -202,10 +202,258 @@ class ConfigFormat(str, Enum):
     block = "block"
 
 
+class RuleOperator(StrEnum):
+    AND = "AND"
+    OR = "OR"
+
+
+class ConditionOperator(StrEnum):
+    EQUALS = "EQUALS"
+    NOT_EQUALS = "NOT_EQUALS"
+    CONTAINS = "CONTAINS"
+    NOT_CONTAINS = "NOT_CONTAINS"
+    STARTS_WITH = "STARTS_WITH"
+    NOT_STARTS_WITH = "NOT_STARTS_WITH"
+    ENDS_WITH = "ENDS_WITH"
+    NOT_ENDS_WITH = "NOT_ENDS_WITH"
+    REGEX = "REGEX"
+    NOT_REGEX = "NOT_REGEX"
+
+
+class ResponseType(StrEnum):
+    MIHOMO = "MIHOMO"
+    CLASH = "CLASH"
+    STASH = "STASH"
+    SINGBOX = "SINGBOX"
+    XRAY_JSON = "XRAY_JSON"
+    XRAY_BASE64 = "XRAY_BASE64"
+    LINKS = "LINKS"
+    WIREGUARD = "WIREGUARD"
+    OUTLINE = "OUTLINE"
+    BROWSER = "BROWSER"
+    BLOCK = "BLOCK"
+    STATUS_CODE_404 = "STATUS_CODE_404"
+    STATUS_CODE_451 = "STATUS_CODE_451"
+    SOCKET_DROP = "SOCKET_DROP"
+
+
+RESPONSE_TYPE_TO_CONFIG_FORMAT: dict[str, ConfigFormat] = {
+    ResponseType.MIHOMO.value: ConfigFormat.clash_meta,
+    ResponseType.CLASH.value: ConfigFormat.clash,
+    ResponseType.STASH.value: ConfigFormat.clash,
+    ResponseType.SINGBOX.value: ConfigFormat.sing_box,
+    ResponseType.XRAY_JSON.value: ConfigFormat.xray,
+    ResponseType.XRAY_BASE64.value: ConfigFormat.links_base64,
+    ResponseType.LINKS.value: ConfigFormat.links,
+    ResponseType.WIREGUARD.value: ConfigFormat.wireguard,
+    ResponseType.OUTLINE.value: ConfigFormat.outline,
+    ResponseType.BLOCK.value: ConfigFormat.block,
+    ConfigFormat.clash_meta.value: ConfigFormat.clash_meta,
+    ConfigFormat.clash.value: ConfigFormat.clash,
+    ConfigFormat.sing_box.value: ConfigFormat.sing_box,
+    ConfigFormat.xray.value: ConfigFormat.xray,
+    ConfigFormat.links_base64.value: ConfigFormat.links_base64,
+    ConfigFormat.links.value: ConfigFormat.links,
+    ConfigFormat.wireguard.value: ConfigFormat.wireguard,
+    ConfigFormat.outline.value: ConfigFormat.outline,
+    ConfigFormat.block.value: ConfigFormat.block,
+}
+
+CONFIG_FORMAT_TO_RESPONSE_TYPE: dict[str, ResponseType] = {
+    ConfigFormat.clash_meta.value: ResponseType.MIHOMO,
+    ConfigFormat.clash.value: ResponseType.CLASH,
+    ConfigFormat.sing_box.value: ResponseType.SINGBOX,
+    ConfigFormat.xray.value: ResponseType.XRAY_JSON,
+    ConfigFormat.links_base64.value: ResponseType.XRAY_BASE64,
+    ConfigFormat.links.value: ResponseType.LINKS,
+    ConfigFormat.wireguard.value: ResponseType.WIREGUARD,
+    ConfigFormat.outline.value: ResponseType.OUTLINE,
+    ConfigFormat.block.value: ResponseType.BLOCK,
+}
+
+
+class RuleCondition(BaseModel):
+    header_name: str = Field(
+        default="user-agent",
+        validation_alias=AliasChoices("headerName", "header_name"),
+        serialization_alias="headerName",
+        min_length=1,
+        max_length=100,
+    )
+    operator: ConditionOperator = ConditionOperator.CONTAINS
+    value: str = Field(default="", max_length=255)
+    case_sensitive: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("caseSensitive", "case_sensitive"),
+        serialization_alias="caseSensitive",
+    )
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    @field_validator("operator", mode="before")
+    @classmethod
+    def normalize_operator(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            val_upper = value.strip().upper()
+            try:
+                return ConditionOperator(val_upper)
+            except ValueError:
+                pass
+        return value
+
+
+class ResponseHeaderItem(BaseModel):
+    key: str = Field(min_length=1, max_length=128)
+    value: Any = Field(default="")
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
+class ResponseModifications(BaseModel):
+    subscription_template: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("subscriptionTemplate", "subscription_template"),
+        serialization_alias="subscriptionTemplate",
+    )
+    headers: list[ResponseHeaderItem] | dict[str, Any] = Field(default_factory=list)
+    apply_headers_to_end: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("applyHeadersToEnd", "apply_headers_to_end"),
+        serialization_alias="applyHeadersToEnd",
+    )
+    ignore_host_xray_json_template: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ignoreHostXrayJsonTemplate", "ignore_host_xray_json_template"),
+        serialization_alias="ignoreHostXrayJsonTemplate",
+    )
+    ignore_serve_json_at_base_subscription: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ignoreServeJsonAtBaseSubscription", "ignore_serve_json_at_base_subscription"),
+        serialization_alias="ignoreServeJsonAtBaseSubscription",
+    )
+    disable_hwid_check: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("disableHwidCheck", "disable_hwid_check"),
+        serialization_alias="disableHwidCheck",
+    )
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class SubRule(BaseModel):
-    pattern: str
-    target: ConfigFormat
-    response_headers: dict[str, Any] = Field(default_factory=dict)
+    name: str = Field(default="", max_length=100)
+    description: str = Field(default="", max_length=250)
+    enabled: bool = Field(default=True)
+    operator: RuleOperator = Field(default=RuleOperator.AND)
+    conditions: list[RuleCondition] = Field(default_factory=list)
+    response_type: ResponseType = Field(
+        default=ResponseType.XRAY_BASE64,
+        validation_alias=AliasChoices("responseType", "response_type"),
+        serialization_alias="responseType",
+    )
+    response_modifications: ResponseModifications = Field(
+        default_factory=ResponseModifications,
+        validation_alias=AliasChoices("responseModifications", "response_modifications"),
+        serialization_alias="responseModifications",
+    )
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    @field_validator("response_type", mode="before")
+    @classmethod
+    def normalize_response_type(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            val_strip = value.strip()
+            val_upper = val_strip.upper()
+            try:
+                return ResponseType(val_upper)
+            except ValueError:
+                pass
+            if val_strip.lower() in CONFIG_FORMAT_TO_RESPONSE_TYPE:
+                return CONFIG_FORMAT_TO_RESPONSE_TYPE[val_strip.lower()]
+        elif isinstance(value, ConfigFormat):
+            return CONFIG_FORMAT_TO_RESPONSE_TYPE.get(value.value, ResponseType.XRAY_BASE64)
+        return value
+
+    @field_validator("operator", mode="before")
+    @classmethod
+    def normalize_operator(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            val_upper = value.strip().upper()
+            try:
+                return RuleOperator(val_upper)
+            except ValueError:
+                pass
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def handle_legacy_sub_rule(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        pattern = data.get("pattern")
+        target = data.get("target")
+        response_headers = data.get("response_headers")
+
+        if pattern is not None or target is not None:
+            name = data.get("name")
+            if not name:
+                if target:
+                    name = f"Rule for {target}"
+                elif pattern:
+                    name = f"Rule: {pattern}"[:50]
+                else:
+                    name = "Legacy Rule"
+            data["name"] = str(name)[:100]
+            conditions = data.get("conditions")
+            if conditions is None and pattern is not None:
+                conditions = [
+                    {
+                        "headerName": "user-agent",
+                        "operator": "REGEX",
+                        "value": pattern,
+                        "caseSensitive": True,
+                    }
+                ]
+            data["conditions"] = conditions or []
+
+            if not data.get("responseType") and not data.get("response_type") and target is not None:
+                data["responseType"] = target
+
+            if not data.get("responseModifications") and not data.get("response_modifications") and response_headers:
+                data["responseModifications"] = {"headers": response_headers}
+
+        return data
+
+    @computed_field
+    @property
+    def pattern(self) -> str:
+        for cond in self.conditions:
+            if cond.header_name.lower() == "user-agent" and cond.operator == ConditionOperator.REGEX:
+                return cond.value
+        return self.conditions[0].value if self.conditions else ".*"
+
+    @computed_field
+    @property
+    def target(self) -> ConfigFormat:
+        return RESPONSE_TYPE_TO_CONFIG_FORMAT.get(self.response_type.value, ConfigFormat.links_base64)
+
+    @computed_field
+    @property
+    def response_headers(self) -> dict[str, Any]:
+        headers = self.response_modifications.headers
+        if isinstance(headers, dict):
+            return headers
+        if isinstance(headers, list):
+            res = {}
+            for item in headers:
+                if isinstance(item, ResponseHeaderItem):
+                    res[item.key] = item.value
+                elif isinstance(item, dict) and "key" in item:
+                    res[item["key"]] = item.get("value", "")
+            return res
+        return {}
 
 
 class SubFormatEnable(BaseModel):
@@ -378,3 +626,112 @@ class SettingsSchema(BaseModel):
     general: General | None = Field(default=None)
 
     model_config = ConfigDict(from_attributes=True)
+
+
+DEFAULT_SUBSCRIPTION_RULES: list[dict[str, Any]] = [
+    {
+        "name": "Clash Meta / Mihomo",
+        "description": "Serve Mihomo YAML configuration",
+        "enabled": True,
+        "operator": "AND",
+        "conditions": [
+            {
+                "headerName": "user-agent",
+                "operator": "REGEX",
+                "value": r"^(?:FlClashX?|Flowvy|[Cc]lash(?:-(?:[Vv]erge|nyanpasu)|X [Mm]eta|-?[Mm]eta)|[Kk]oala-[Cc]lash|[Mm](?:urge|ihomo)|prizrak-box|clash\.meta)",
+                "caseSensitive": True,
+            }
+        ],
+        "responseType": "MIHOMO",
+        "responseModifications": {},
+    },
+    {
+        "name": "Clash / Stash",
+        "description": "Serve Clash YAML configuration",
+        "enabled": True,
+        "operator": "AND",
+        "conditions": [
+            {
+                "headerName": "user-agent",
+                "operator": "REGEX",
+                "value": r"^([Cc]lash|[Ss]tash)",
+                "caseSensitive": True,
+            }
+        ],
+        "responseType": "CLASH",
+        "responseModifications": {},
+    },
+    {
+        "name": "Sing-box",
+        "description": "Serve Sing-box JSON configuration",
+        "enabled": True,
+        "operator": "AND",
+        "conditions": [
+            {
+                "headerName": "user-agent",
+                "operator": "REGEX",
+                "value": r"^(SFA|SFI|SFM|SFT|[Kk]aring|[Hh]iddify[Nn]ext)|.*[Ss]ing[\-b]?ox.*",
+                "caseSensitive": True,
+            }
+        ],
+        "responseType": "SINGBOX",
+        "responseModifications": {},
+    },
+    {
+        "name": "Outline / Shadowsocks",
+        "description": "Serve Outline / Shadowsocks configuration",
+        "enabled": True,
+        "operator": "AND",
+        "conditions": [
+            {
+                "headerName": "user-agent",
+                "operator": "REGEX",
+                "value": r"^(SS|SSR|SSD|SSS|Outline|Shadowsocks|SSconf)",
+                "caseSensitive": True,
+            }
+        ],
+        "responseType": "OUTLINE",
+        "responseModifications": {},
+    },
+    {
+        "name": "Xray / InHive / V2Ray",
+        "description": "Serve Xray JSON configuration",
+        "enabled": True,
+        "operator": "AND",
+        "conditions": [
+            {
+                "headerName": "user-agent",
+                "operator": "REGEX",
+                "value": r"^[Ii]n[Hh]ive|^([Vv]2rayNG|[Vv]2rayN|[Ss]treisand|[Hh]app|[Kk]tor\-client)",
+                "caseSensitive": True,
+            }
+        ],
+        "responseType": "XRAY_JSON",
+        "responseModifications": {},
+    },
+    {
+        "name": "Web Browser",
+        "description": "Serve HTML subscription page for browsers",
+        "enabled": True,
+        "operator": "AND",
+        "conditions": [
+            {
+                "headerName": "accept",
+                "operator": "CONTAINS",
+                "value": "text/html",
+                "caseSensitive": False,
+            }
+        ],
+        "responseType": "BROWSER",
+        "responseModifications": {},
+    },
+    {
+        "name": "Default Fallback",
+        "description": "Fallback rule for all other clients",
+        "enabled": True,
+        "operator": "AND",
+        "conditions": [],
+        "responseType": "XRAY_BASE64",
+        "responseModifications": {},
+    },
+]

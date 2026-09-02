@@ -8,7 +8,13 @@ import { SubscriptionManualFormatsSection } from '@/features/subscriptions/compo
 import { SubscriptionResponseHeadersSection } from '@/features/subscriptions/components/subscription-response-headers-section'
 import { SubscriptionRulesSection } from '@/features/subscriptions/components/subscription-rules-section'
 import { SubscriptionSettingsSkeleton } from '@/features/subscriptions/components/subscription-settings-skeleton'
-import { subscriptionSchema, type SubscriptionApplicationFormData, type SubscriptionFormData, defaultSubscriptionRules, normalizeCustomVariablesForPayload } from '@/features/subscriptions/components/subscription-settings-schema'
+import {
+  subscriptionSchema,
+  type SubscriptionApplicationFormData,
+  type SubscriptionFormData,
+  defaultSubscriptionRules,
+  normalizeCustomVariablesForPayload,
+} from '@/features/subscriptions/components/subscription-settings-schema'
 import { Form } from '@/components/ui/form'
 import { Separator } from '@/components/ui/separator'
 import { type SubRule as ApiSubRule } from '@/service/api'
@@ -125,11 +131,78 @@ export default function SubscriptionSettings() {
         custom_variables: subscriptionData.custom_variables || [],
         response_headers: Object.fromEntries(Object.entries(subscriptionData.response_headers || {}).map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)])),
         rules:
-          subscriptionData.rules?.map((rule: ApiSubRule) => ({
-            pattern: rule.pattern,
-            target: rule.target,
-            response_headers: Object.fromEntries(Object.entries(rule.response_headers || {}).map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)])),
-          })) || [],
+          subscriptionData.rules?.map((rule: ApiSubRule) => {
+            let conditions = rule.conditions || []
+            let responseType = rule.responseType
+            const legacyTarget = (rule as any).target
+            const legacyPattern = (rule as any).pattern
+
+            if ((!responseType || (responseType as string) === '') && legacyTarget) {
+              const map: Record<string, any> = {
+                clash_meta: 'MIHOMO',
+                clash: 'CLASH',
+                sing_box: 'SINGBOX',
+                xray: 'XRAY_JSON',
+                links_base64: 'XRAY_BASE64',
+                links: 'LINKS',
+                wireguard: 'WIREGUARD',
+                outline: 'OUTLINE',
+                block: 'BLOCK',
+              }
+              responseType = map[legacyTarget] || 'XRAY_BASE64'
+            }
+
+            if (conditions.length === 0 && legacyPattern) {
+              conditions = [
+                {
+                  headerName: 'user-agent',
+                  operator: 'REGEX',
+                  value: legacyPattern,
+                  caseSensitive: true,
+                },
+              ]
+            }
+
+            const mods = rule.responseModifications || {}
+            let rawHeaders = mods.headers
+            if (!rawHeaders && (rule as any).response_headers) {
+              rawHeaders = (rule as any).response_headers
+            }
+            let headerItems: { key: string; value: string }[] = []
+            if (Array.isArray(rawHeaders)) {
+              headerItems = rawHeaders.map(h => ({
+                key: (h as any).key || '',
+                value: typeof (h as any).value === 'string' ? (h as any).value : JSON.stringify((h as any).value ?? ''),
+              }))
+            } else if (rawHeaders && typeof rawHeaders === 'object') {
+              headerItems = Object.entries(rawHeaders).map(([k, v]) => ({
+                key: k,
+                value: typeof v === 'string' ? v : JSON.stringify(v ?? ''),
+              }))
+            }
+
+            return {
+              name: rule.name || (rule.conditions?.[0]?.value ? `Rule: ${rule.conditions[0].value}` : 'Rule'),
+              description: rule.description || '',
+              enabled: rule.enabled ?? true,
+              operator: (rule.operator as 'AND' | 'OR') || 'AND',
+              conditions: conditions.map(c => ({
+                headerName: c.headerName || 'user-agent',
+                operator: (c.operator as any) || 'CONTAINS',
+                value: c.value || '',
+                caseSensitive: c.caseSensitive ?? false,
+              })),
+              responseType: (responseType as any) || 'XRAY_BASE64',
+              responseModifications: {
+                subscriptionTemplate: mods.subscriptionTemplate || null,
+                headers: headerItems,
+                applyHeadersToEnd: mods.applyHeadersToEnd ?? false,
+                ignoreHostXrayJsonTemplate: mods.ignoreHostXrayJsonTemplate ?? false,
+                ignoreServeJsonAtBaseSubscription: mods.ignoreServeJsonAtBaseSubscription ?? false,
+                disableHwidCheck: mods.disableHwidCheck ?? false,
+              },
+            }
+          }) || [],
         applications: subscriptionData.applications || [],
         manual_sub_request: {
           links: subscriptionData.manual_sub_request?.links ?? true,
@@ -148,13 +221,25 @@ export default function SubscriptionSettings() {
   const onSubmit = async (data: SubscriptionFormData) => {
     try {
       const processedRules = (data.rules || []).map(rule => ({
-        pattern: rule.pattern.trim(),
-        target: rule.target,
-        response_headers: Object.fromEntries(
-          Object.entries(rule.response_headers || {})
-            .map(([key, value]) => [key.trim(), value.trim()] as const)
-            .filter(([key, value]) => key && value),
-        ),
+        name: rule.name?.trim() || '',
+        description: rule.description?.trim() || '',
+        enabled: rule.enabled ?? true,
+        operator: rule.operator || 'AND',
+        conditions: (rule.conditions || []).map(cond => ({
+          headerName: cond.headerName.trim().toLowerCase(),
+          operator: cond.operator,
+          value: cond.value,
+          caseSensitive: cond.caseSensitive ?? false,
+        })),
+        responseType: rule.responseType,
+        responseModifications: {
+          subscriptionTemplate: rule.responseModifications?.subscriptionTemplate || null,
+          headers: (rule.responseModifications?.headers || []).map(h => ({ key: h.key.trim(), value: h.value })).filter(h => h.key),
+          applyHeadersToEnd: rule.responseModifications?.applyHeadersToEnd ?? false,
+          ignoreHostXrayJsonTemplate: rule.responseModifications?.ignoreHostXrayJsonTemplate ?? false,
+          ignoreServeJsonAtBaseSubscription: rule.responseModifications?.ignoreServeJsonAtBaseSubscription ?? false,
+          disableHwidCheck: rule.responseModifications?.disableHwidCheck ?? false,
+        },
       }))
 
       const processedResponseHeaders = Object.fromEntries(
@@ -321,7 +406,29 @@ export default function SubscriptionSettings() {
   }
 
   const addRule = () => {
-    appendRule({ pattern: '', target: 'links', response_headers: {} })
+    appendRule({
+      name: 'New Rule',
+      description: '',
+      enabled: true,
+      operator: 'AND',
+      conditions: [
+        {
+          headerName: 'user-agent',
+          operator: 'CONTAINS',
+          value: '',
+          caseSensitive: false,
+        },
+      ],
+      responseType: 'XRAY_BASE64',
+      responseModifications: {
+        subscriptionTemplate: null,
+        headers: [],
+        applyHeadersToEnd: false,
+        ignoreHostXrayJsonTemplate: false,
+        ignoreServeJsonAtBaseSubscription: false,
+        disableHwidCheck: false,
+      },
+    })
   }
 
   const addApplication = () => {

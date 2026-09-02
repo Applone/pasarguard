@@ -32,6 +32,7 @@ async def user_subscription(
         user_agent=user_agent,
         ip=request.client.host if request.client else None,
         request_url=str(request.url),
+        request=request,
         **headers.model_dump(),
     )
 
@@ -51,6 +52,7 @@ async def user_subscription_headers(
         accept_header=request.headers.get("Accept", ""),
         user_agent=user_agent,
         request_url=str(request.url),
+        request=request,
     )
     return Response(headers=response_headers)
 

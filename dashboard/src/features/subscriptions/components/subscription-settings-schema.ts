@@ -110,9 +110,47 @@ export const subscriptionSchema = z.object({
   response_headers: z.record(z.string()).optional(),
   rules: z.array(
     z.object({
-      pattern: z.string().min(1, 'Pattern is required'),
-      target: z.enum(['links', 'links_base64', 'xray', 'wireguard', 'sing_box', 'clash', 'clash_meta', 'outline', 'block']),
-      response_headers: z.record(z.string()).optional(),
+      name: z.string().max(50).default(''),
+      description: z.string().max(250).default(''),
+      enabled: z.boolean().default(true),
+      operator: z.enum(['AND', 'OR']).default('AND'),
+      conditions: z
+        .array(
+          z.object({
+            headerName: z.string().min(1, 'Header name is required'),
+            operator: z.enum(['EQUALS', 'NOT_EQUALS', 'CONTAINS', 'NOT_CONTAINS', 'STARTS_WITH', 'NOT_STARTS_WITH', 'ENDS_WITH', 'NOT_ENDS_WITH', 'REGEX', 'NOT_REGEX']).default('CONTAINS'),
+            value: z.string().default(''),
+            caseSensitive: z.boolean().default(false),
+          }),
+        )
+        .default([]),
+      responseType: z
+        .enum(['MIHOMO', 'CLASH', 'STASH', 'SINGBOX', 'XRAY_JSON', 'XRAY_BASE64', 'LINKS', 'WIREGUARD', 'OUTLINE', 'BROWSER', 'BLOCK', 'STATUS_CODE_404', 'STATUS_CODE_451', 'SOCKET_DROP'])
+        .default('XRAY_BASE64'),
+      responseModifications: z
+        .object({
+          subscriptionTemplate: z.string().nullable().optional(),
+          headers: z
+            .array(
+              z.object({
+                key: z.string().min(1, 'Header key is required'),
+                value: z.string().default(''),
+              }),
+            )
+            .default([]),
+          applyHeadersToEnd: z.boolean().default(false),
+          ignoreHostXrayJsonTemplate: z.boolean().default(false),
+          ignoreServeJsonAtBaseSubscription: z.boolean().default(false),
+          disableHwidCheck: z.boolean().default(false),
+        })
+        .default({
+          subscriptionTemplate: null,
+          headers: [],
+          applyHeadersToEnd: false,
+          ignoreHostXrayJsonTemplate: false,
+          ignoreServeJsonAtBaseSubscription: false,
+          disableHwidCheck: false,
+        }),
     }),
   ),
   applications: z.array(subscriptionApplicationSchema).optional(),
@@ -137,27 +175,157 @@ export type SubscriptionLanguage = NonNullable<SubscriptionApplicationFormData['
 
 export const defaultSubscriptionRules: SubscriptionRuleFormData[] = [
   {
-    pattern: '^([Cc]lash[\\-\\.]?[Vv]erge|[Cc]lash[\\-\\.]?[Mm]eta|[Ff][Ll][Cc]lash|[Mm]ihomo)',
-    target: 'clash_meta',
+    name: 'Clash Meta / Mihomo',
+    description: 'Serve Mihomo YAML configuration',
+    enabled: true,
+    operator: 'AND',
+    conditions: [
+      {
+        headerName: 'user-agent',
+        operator: 'REGEX',
+        value: '^(?:FlClashX?|Flowvy|[Cc]lash(?:-(?:[Vv]erge|nyanpasu)|X [Mm]eta|-?[Mm]eta)|[Kk]oala-[Cc]lash|[Mm](?:urge|ihomo)|prizrak-box|clash\\.meta)',
+        caseSensitive: true,
+      },
+    ],
+    responseType: 'MIHOMO',
+    responseModifications: {
+      subscriptionTemplate: null,
+      headers: [],
+      applyHeadersToEnd: false,
+      ignoreHostXrayJsonTemplate: false,
+      ignoreServeJsonAtBaseSubscription: false,
+      disableHwidCheck: false,
+    },
   },
   {
-    pattern: '^([Cc]lash|[Ss]tash)',
-    target: 'clash',
+    name: 'Clash / Stash',
+    description: 'Serve Clash YAML configuration',
+    enabled: true,
+    operator: 'AND',
+    conditions: [
+      {
+        headerName: 'user-agent',
+        operator: 'REGEX',
+        value: '^([Cc]lash|[Ss]tash)',
+        caseSensitive: true,
+      },
+    ],
+    responseType: 'CLASH',
+    responseModifications: {
+      subscriptionTemplate: null,
+      headers: [],
+      applyHeadersToEnd: false,
+      ignoreHostXrayJsonTemplate: false,
+      ignoreServeJsonAtBaseSubscription: false,
+      disableHwidCheck: false,
+    },
   },
   {
-    pattern: '^(SFA|SFI|SFM|SFT|[Kk]aring|[Hh]iddify[Nn]ext)|.*[Ss]ing[\\-b]?ox.*',
-    target: 'sing_box',
+    name: 'Sing-box',
+    description: 'Serve Sing-box JSON configuration',
+    enabled: true,
+    operator: 'AND',
+    conditions: [
+      {
+        headerName: 'user-agent',
+        operator: 'REGEX',
+        value: '^(SFA|SFI|SFM|SFT|[Kk]aring|[Hh]iddify[Nn]ext)|.*[Ss]ing[\\-b]?ox.*',
+        caseSensitive: true,
+      },
+    ],
+    responseType: 'SINGBOX',
+    responseModifications: {
+      subscriptionTemplate: null,
+      headers: [],
+      applyHeadersToEnd: false,
+      ignoreHostXrayJsonTemplate: false,
+      ignoreServeJsonAtBaseSubscription: false,
+      disableHwidCheck: false,
+    },
   },
   {
-    pattern: '^(SS|SSR|SSD|SSS|Outline|Shadowsocks|SSconf)',
-    target: 'outline',
+    name: 'Outline / Shadowsocks',
+    description: 'Serve Outline / Shadowsocks configuration',
+    enabled: true,
+    operator: 'AND',
+    conditions: [
+      {
+        headerName: 'user-agent',
+        operator: 'REGEX',
+        value: '^(SS|SSR|SSD|SSS|Outline|Shadowsocks|SSconf)',
+        caseSensitive: true,
+      },
+    ],
+    responseType: 'OUTLINE',
+    responseModifications: {
+      subscriptionTemplate: null,
+      headers: [],
+      applyHeadersToEnd: false,
+      ignoreHostXrayJsonTemplate: false,
+      ignoreServeJsonAtBaseSubscription: false,
+      disableHwidCheck: false,
+    },
   },
   {
-    pattern: '^([Vv]2rayNG|[Vv]2rayN|[Ss]treisand|[Hh]app|[Kk]tor\\-client)',
-    target: 'xray',
+    name: 'Xray / InHive / V2Ray',
+    description: 'Serve Xray JSON configuration',
+    enabled: true,
+    operator: 'AND',
+    conditions: [
+      {
+        headerName: 'user-agent',
+        operator: 'REGEX',
+        value: '^[Ii]n[Hh]ive|^([Vv]2rayNG|[Vv]2rayN|[Ss]treisand|[Hh]app|[Kk]tor\\-client)',
+        caseSensitive: true,
+      },
+    ],
+    responseType: 'XRAY_JSON',
+    responseModifications: {
+      subscriptionTemplate: null,
+      headers: [],
+      applyHeadersToEnd: false,
+      ignoreHostXrayJsonTemplate: false,
+      ignoreServeJsonAtBaseSubscription: false,
+      disableHwidCheck: false,
+    },
   },
   {
-    pattern: '.*',
-    target: 'links_base64',
+    name: 'Web Browser',
+    description: 'Serve HTML subscription page for browsers',
+    enabled: true,
+    operator: 'AND',
+    conditions: [
+      {
+        headerName: 'accept',
+        operator: 'CONTAINS',
+        value: 'text/html',
+        caseSensitive: false,
+      },
+    ],
+    responseType: 'BROWSER',
+    responseModifications: {
+      subscriptionTemplate: null,
+      headers: [],
+      applyHeadersToEnd: false,
+      ignoreHostXrayJsonTemplate: false,
+      ignoreServeJsonAtBaseSubscription: false,
+      disableHwidCheck: false,
+    },
+  },
+  {
+    name: 'Default Fallback',
+    description: 'Fallback rule for all other clients',
+    enabled: true,
+    operator: 'AND',
+    conditions: [],
+    responseType: 'XRAY_BASE64',
+    responseModifications: {
+      subscriptionTemplate: null,
+      headers: [],
+      applyHeadersToEnd: false,
+      ignoreHostXrayJsonTemplate: false,
+      ignoreServeJsonAtBaseSubscription: false,
+      disableHwidCheck: false,
+    },
   },
 ]

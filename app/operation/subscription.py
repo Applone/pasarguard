@@ -2,7 +2,7 @@ import re
 from json import dumps as json_dumps
 from typing import Any, ClassVar
 
-from fastapi import Response
+from fastapi import Request, Response
 from fastapi.responses import HTMLResponse
 
 from app.db import AsyncSession
@@ -14,11 +14,25 @@ from app.db.crud.hwid import (
 from app.db.crud.user import get_user_usages, user_sub_update
 from app.db.models import User
 from app.models.admin import AdminDetails
-from app.models.settings import Application, ConfigFormat, HWIDSettings, SubRule, Subscription as SubSettings
+from app.models.client_template import ClientTemplateType
+from app.models.settings import (
+    RESPONSE_TYPE_TO_CONFIG_FORMAT,
+    Application,
+    ConditionOperator,
+    ConfigFormat,
+    HWIDSettings,
+    ResponseHeaderItem,
+    ResponseType,
+    RuleCondition,
+    RuleOperator,
+    SubRule,
+    Subscription as SubSettings,
+)
 from app.models.stats import UserUsageStatsList
 from app.models.subscription import SubscriptionUsageQuery
 from app.models.user import SubscriptionUserResponse, UsersResponseWithInbounds
 from app.settings import hwid_settings, subscription_settings
+from app.subscription.client_templates import resolve_client_template_content
 from app.subscription.share import (
     apply_custom_format_variables,
     encode_title,
@@ -85,6 +99,83 @@ client_config = {
 }
 
 
+def extract_request_headers(headers_source: Any) -> dict[str, str]:
+    if headers_source is None:
+        return {}
+    if isinstance(headers_source, Request):
+        raw_headers: dict[str, list[str]] = {}
+        for key, value in headers_source.headers.raw:
+            k = key.decode("latin-1").lower()
+            v = value.decode("latin-1")
+            raw_headers.setdefault(k, []).append(v)
+        return {k: ", ".join(vals) for k, vals in raw_headers.items()}
+    if hasattr(headers_source, "items"):
+        return {str(k).lower(): str(v) for k, v in headers_source.items()}
+    if isinstance(headers_source, str):
+        return {"user-agent": headers_source}
+    return {}
+
+
+def evaluate_condition(condition: RuleCondition, headers: dict[str, str]) -> bool:
+    header_key = condition.header_name.lower()
+    if header_key not in headers:
+        return False
+    header_val = headers[header_key]
+    if header_val is None or header_val == "":
+        return False
+
+    cond_val = condition.value or ""
+    cmp_header = header_val
+    cmp_cond = cond_val
+
+    if not condition.case_sensitive:
+        cmp_header = header_val.lower()
+        cmp_cond = cond_val.lower()
+
+    op = condition.operator
+    if op == ConditionOperator.EQUALS:
+        return cmp_header == cmp_cond
+    if op == ConditionOperator.NOT_EQUALS:
+        return cmp_header != cmp_cond
+    if op == ConditionOperator.CONTAINS:
+        return cmp_cond in cmp_header
+    if op == ConditionOperator.NOT_CONTAINS:
+        return cmp_cond not in cmp_header
+    if op == ConditionOperator.STARTS_WITH:
+        return cmp_header.startswith(cmp_cond)
+    if op == ConditionOperator.NOT_STARTS_WITH:
+        return not cmp_header.startswith(cmp_cond)
+    if op == ConditionOperator.ENDS_WITH:
+        return cmp_header.endswith(cmp_cond)
+    if op == ConditionOperator.NOT_ENDS_WITH:
+        return not cmp_header.endswith(cmp_cond)
+    if op == ConditionOperator.REGEX:
+        flags = 0 if condition.case_sensitive else re.IGNORECASE
+        try:
+            return bool(re.search(cond_val, header_val, flags))
+        except re.error:
+            return False
+    if op == ConditionOperator.NOT_REGEX:
+        flags = 0 if condition.case_sensitive else re.IGNORECASE
+        try:
+            return not bool(re.search(cond_val, header_val, flags))
+        except re.error:
+            return False
+    return False
+
+
+def match_rule(rule: SubRule, headers: dict[str, str]) -> bool:
+    if not rule.enabled:
+        return False
+    if not rule.conditions:
+        return True
+    if rule.operator == RuleOperator.AND:
+        return all(evaluate_condition(c, headers) for c in rule.conditions)
+    if rule.operator == RuleOperator.OR:
+        return any(evaluate_condition(c, headers) for c in rule.conditions)
+    return False
+
+
 class SubscriptionOperation(BaseOperation):
     _ENCODED_RULE_RESPONSE_HEADERS: ClassVar[set[str]] = {"announce", "profile-title"}
 
@@ -98,17 +189,19 @@ class SubscriptionOperation(BaseOperation):
         return user
 
     @staticmethod
-    async def detect_client_type(user_agent: str, rules: list[SubRule]) -> ConfigFormat | None:
-        """Detect the appropriate client configuration based on the user agent."""
-        for rule in rules:
-            if re.match(rule.pattern, user_agent):
-                return rule.target
+    async def detect_client_type(headers_or_user_agent: Any, rules: list[SubRule]) -> ConfigFormat | None:
+        """Detect the appropriate client configuration format based on the headers or user agent."""
+        rule = SubscriptionOperation.detect_client_rule(headers_or_user_agent, rules)
+        if rule:
+            return rule.target
+        return None
 
     @staticmethod
-    def detect_client_rule(user_agent: str, rules: list[SubRule]) -> SubRule | None:
-        """Return the first matching subscription rule for the provided user agent."""
+    def detect_client_rule(headers_or_user_agent: Any, rules: list[SubRule]) -> SubRule | None:
+        """Return the first matching subscription rule for the provided headers or user agent."""
+        headers = extract_request_headers(headers_or_user_agent)
         for rule in rules:
-            if re.match(rule.pattern, user_agent):
+            if match_rule(rule, headers):
                 return rule
         return None
 
@@ -206,11 +299,33 @@ class SubscriptionOperation(BaseOperation):
     def _format_rule_response_headers(
         cls, rule: SubRule | None, format_variables: dict[str, str | int | float]
     ) -> dict[str, str]:
-        if not rule or not rule.response_headers:
+        if not rule:
             return {}
 
+        raw_headers = None
+        if getattr(rule, "response_modifications", None):
+            raw_headers = rule.response_modifications.headers
+        if not raw_headers and hasattr(rule, "response_headers"):
+            raw_headers = rule.response_headers
+
+        if not raw_headers:
+            return {}
+
+        items: list[tuple[Any, Any]] = []
+        if isinstance(raw_headers, dict):
+            items = list(raw_headers.items())
+        elif isinstance(raw_headers, list):
+            for item in raw_headers:
+                if isinstance(item, ResponseHeaderItem):
+                    items.append((item.key, item.value))
+                elif isinstance(item, dict):
+                    if "key" in item:
+                        items.append((item["key"], item.get("value", "")))
+                elif hasattr(item, "key") and hasattr(item, "value"):
+                    items.append((item.key, item.value))
+
         headers: dict[str, str] = {}
-        for raw_name, raw_value in rule.response_headers.items():
+        for raw_name, raw_value in items:
             header_name = str(raw_name).strip()
             if not header_name or raw_value is None:
                 continue
@@ -286,7 +401,13 @@ class SubscriptionOperation(BaseOperation):
         # Only include headers that have values
         return {k: v for k, v in headers.items() if v}
 
-    async def fetch_config(self, user: UsersResponseWithInbounds, client_type: ConfigFormat) -> tuple[str | bytes, str]:
+    async def fetch_config(
+        self,
+        user: UsersResponseWithInbounds,
+        client_type: ConfigFormat,
+        template_content: str | None = None,
+        ignore_host_xray_template: bool = False,
+    ) -> tuple[str | bytes, str]:
         # Get client configuration
         config = client_config.get(client_type, {})
         sub_settings = await subscription_settings()
@@ -299,6 +420,8 @@ class SubscriptionOperation(BaseOperation):
                 config_format=config.get("config_format", ""),
                 as_base64=config.get("as_base64", ""),
                 randomize_order=randomize_order,
+                custom_template_content=template_content,
+                ignore_host_xray_template=ignore_host_xray_template,
             ),
             config["media_type"],
         )
@@ -412,17 +535,52 @@ class SubscriptionOperation(BaseOperation):
         x_device_os: str | None = None,
         x_ver_os: str | None = None,
         x_device_model: str | None = None,
+        request: Request | None = None,
+        request_headers: dict[str, str] | None = None,
     ):
         """
-        Provides a subscription link based on the user agent (Clash, V2Ray, etc.).
+        Provides a subscription link based on request headers (Remnawave SSR) or user agent.
         """
         sub_settings: SubSettings = await subscription_settings()
         db_user = await self.get_validated_sub(db, token, load_admin_role=True)
         role_hwid_settings = db_user.admin.role.hwid if db_user.admin and db_user.admin.role else None
         user = await self.validated_user(db_user)
-        is_browser_request = "text/html" in accept_header
-        is_subscription_page_request = is_browser_request and not sub_settings.disable_sub_template
-        if is_subscription_page_request:
+
+        # Build full headers map
+        headers_map: dict[str, str] = {}
+        if request is not None:
+            headers_map = extract_request_headers(request)
+        elif request_headers is not None:
+            headers_map = extract_request_headers(request_headers)
+
+        if user_agent and "user-agent" not in headers_map:
+            headers_map["user-agent"] = user_agent
+        if accept_header and "accept" not in headers_map:
+            headers_map["accept"] = accept_header
+        if x_hwid and "x-hwid" not in headers_map:
+            headers_map["x-hwid"] = x_hwid
+        if x_device_os and "x-device-os" not in headers_map:
+            headers_map["x-device-os"] = x_device_os
+        if x_ver_os and "x-ver-os" not in headers_map:
+            headers_map["x-ver-os"] = x_ver_os
+        if x_device_model and "x-device-model" not in headers_map:
+            headers_map["x-device-model"] = x_device_model
+
+        effective_user_agent = headers_map.get("user-agent", user_agent)
+        effective_accept = headers_map.get("accept", accept_header)
+        is_browser_request = "text/html" in effective_accept
+
+        # Match rule from subscription rules
+        matched_rule = self.detect_client_rule(headers_map, sub_settings.rules)
+
+        is_subscription_page = False
+        if matched_rule is not None:
+            if matched_rule.response_type == ResponseType.BROWSER:
+                is_subscription_page = True
+        elif is_browser_request and not sub_settings.disable_sub_template:
+            is_subscription_page = True
+
+        if is_subscription_page:
             is_hwid_enabled = await self.is_user_hwid_enabled(db_user)
             template = (
                 db_user.admin.sub_template
@@ -452,49 +610,107 @@ class SubscriptionOperation(BaseOperation):
                     ),
                 )
             )
-        else:
+
+        if not matched_rule:
+            await self.raise_error(message="Client not supported", code=406)
+
+        resp_type = matched_rule.response_type
+
+        # Handle special Remnawave response types
+        if resp_type == ResponseType.BLOCK:
+            return Response(content="Forbidden", status_code=403)
+        if resp_type == ResponseType.STATUS_CODE_404:
+            return Response(content="Not Found", status_code=404)
+        if resp_type == ResponseType.STATUS_CODE_451:
+            return Response(content="Unavailable For Legal Reasons", status_code=451)
+        if resp_type == ResponseType.SOCKET_DROP:
+            if request is not None and "transport" in request.scope:
+                try:
+                    request.scope["transport"].abort()
+                except Exception:
+                    try:
+                        request.scope["transport"].close()
+                    except Exception:
+                        pass
+            return Response(status_code=444, headers={"Connection": "close"})
+
+        client_type = RESPONSE_TYPE_TO_CONFIG_FORMAT.get(resp_type.value, matched_rule.target)
+        if client_type == ConfigFormat.block or not client_type:
+            await self.raise_error(message="Client not supported", code=406)
+
+        # Check HWID enforcement unless disabled in rule
+        disable_hwid = bool(
+            matched_rule.response_modifications and matched_rule.response_modifications.disable_hwid_check
+        )
+        if not disable_hwid:
             await self.validate_and_register_hwid(
                 db,
                 db_user.id,
                 db_user.hwid_limit,
                 role_hwid_settings,
-                x_hwid,
-                x_device_os,
-                x_ver_os,
-                x_device_model,
+                headers_map.get("x-hwid"),
+                headers_map.get("x-device-os"),
+                headers_map.get("x-ver-os"),
+                headers_map.get("x-device-model"),
             )
-            matched_rule = self.detect_client_rule(user_agent, sub_settings.rules)
-            client_type = matched_rule.target if matched_rule else None
-            if client_type == ConfigFormat.block or not client_type:
-                await self.raise_error(message="Client not supported", code=406)
 
-            # Update user subscription info
-            await user_sub_update(db, db_user.id, user_agent, ip=ip, hwid=x_hwid)
-            conf, media_type = await self.fetch_config(user, client_type)
+        # Update user subscription info
+        await user_sub_update(db, db_user.id, effective_user_agent, ip=ip, hwid=headers_map.get("x-hwid"))
 
-            # If disable_sub_template is True and it's a browser request, use inline to view instead of download
-            inline_view = sub_settings.disable_sub_template and is_browser_request
-            response_headers = self.create_response_headers(
-                user,
-                request_url,
-                sub_settings,
-                inline=inline_view,
-                extra_headers={},
+        # Resolve custom template if specified
+        custom_template_content = None
+        sub_template_name = (
+            matched_rule.response_modifications.subscription_template if matched_rule.response_modifications else None
+        )
+        if sub_template_name:
+            template_type_map = {
+                ConfigFormat.xray: ClientTemplateType.xray_subscription,
+                ConfigFormat.sing_box: ClientTemplateType.singbox_subscription,
+                ConfigFormat.clash: ClientTemplateType.clash_subscription,
+                ConfigFormat.clash_meta: ClientTemplateType.clash_subscription,
+            }
+            if client_type in template_type_map:
+                custom_template_content = await resolve_client_template_content(
+                    template_type_map[client_type], sub_template_name
+                )
+
+        ignore_host_xray = bool(
+            matched_rule.response_modifications and matched_rule.response_modifications.ignore_host_xray_json_template
+        )
+
+        conf, media_type = await self.fetch_config(
+            user,
+            client_type,
+            template_content=custom_template_content,
+            ignore_host_xray_template=ignore_host_xray,
+        )
+
+        # If disable_sub_template is True and it's a browser request, use inline to view instead of download
+        inline_view = sub_settings.disable_sub_template and is_browser_request
+        response_headers = self.create_response_headers(
+            user,
+            request_url,
+            sub_settings,
+            inline=inline_view,
+            extra_headers={},
+        )
+        try:
+            rule_vars = await self._get_rule_response_header_variables(user, client_type)
+            response_headers.update(self._format_subscription_response_headers(sub_settings, rule_vars))
+
+            rule_headers = self._format_rule_response_headers(matched_rule, rule_vars)
+            apply_to_end = bool(
+                matched_rule.response_modifications and matched_rule.response_modifications.apply_headers_to_end
             )
-            try:
-                response_headers.update(
-                    self._format_subscription_response_headers(
-                        sub_settings, await self._get_rule_response_header_variables(user, client_type)
-                    )
-                )
-                response_headers.update(
-                    self._format_rule_response_headers(
-                        matched_rule, await self._get_rule_response_header_variables(user, client_type)
-                    )
-                )
-                response_headers = self.sanitize_response_headers(response_headers)
-            except ValueError as exc:
-                await self.raise_error(message=str(exc), code=400)
+            if not apply_to_end:
+                response_headers.update(rule_headers)
+
+            response_headers = self.sanitize_response_headers(response_headers)
+
+            if apply_to_end:
+                response_headers.update(self.sanitize_response_headers(rule_headers))
+        except ValueError as exc:
+            await self.raise_error(message=str(exc), code=400)
 
         # Create response with appropriate headers
         return Response(content=conf, media_type=media_type, headers=response_headers)
@@ -733,6 +949,8 @@ class SubscriptionOperation(BaseOperation):
         accept_header: str = "",
         user_agent: str = "",
         request_url: str = "",
+        request: Request | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> dict[str, str]:
         """
         Retrieves only the headers for a subscription request, bypassing configuration generation.
@@ -740,45 +958,80 @@ class SubscriptionOperation(BaseOperation):
         sub_settings: SubSettings = await subscription_settings()
         db_user = await self.get_validated_sub(db, token, load_admin_role=True)
         user = await self.validated_user(db_user)
-        is_browser_request = "text/html" in accept_header
-        is_subscription_page_request = is_browser_request and not sub_settings.disable_sub_template
-        if is_subscription_page_request:
-            response_headers = {
+
+        headers_map: dict[str, str] = {}
+        if request is not None:
+            headers_map = extract_request_headers(request)
+        elif request_headers is not None:
+            headers_map = extract_request_headers(request_headers)
+
+        if user_agent and "user-agent" not in headers_map:
+            headers_map["user-agent"] = user_agent
+        if accept_header and "accept" not in headers_map:
+            headers_map["accept"] = accept_header
+
+        effective_accept = headers_map.get("accept", accept_header)
+        is_browser_request = "text/html" in effective_accept
+
+        matched_rule = self.detect_client_rule(headers_map, sub_settings.rules)
+
+        is_subscription_page = False
+        if matched_rule is not None:
+            if matched_rule.response_type == ResponseType.BROWSER:
+                is_subscription_page = True
+        elif is_browser_request and not sub_settings.disable_sub_template:
+            is_subscription_page = True
+
+        if is_subscription_page:
+            return {
                 "content-type": "text/html; charset=utf-8",
             }
-        else:
-            matched_rule = self.detect_client_rule(user_agent, sub_settings.rules)
-            client_type = matched_rule.target if matched_rule else None
-            if client_type == ConfigFormat.block or not client_type:
-                await self.raise_error(message="Client not supported", code=406)
 
-            # If disable_sub_template is True and it's a browser request, use inline to view instead of download
-            inline_view = sub_settings.disable_sub_template and is_browser_request
-            response_headers = self.create_response_headers(
-                user,
-                request_url,
-                sub_settings,
-                inline=inline_view,
-                extra_headers={},
+        if not matched_rule:
+            await self.raise_error(message="Client not supported", code=406)
+
+        resp_type = matched_rule.response_type
+        if resp_type == ResponseType.BLOCK:
+            await self.raise_error(message="Forbidden", code=403)
+        if resp_type == ResponseType.STATUS_CODE_404:
+            await self.raise_error(message="Not Found", code=404)
+        if resp_type == ResponseType.STATUS_CODE_451:
+            await self.raise_error(message="Unavailable For Legal Reasons", code=451)
+
+        client_type = RESPONSE_TYPE_TO_CONFIG_FORMAT.get(resp_type.value, matched_rule.target)
+        if client_type == ConfigFormat.block or not client_type:
+            await self.raise_error(message="Client not supported", code=406)
+
+        # If disable_sub_template is True and it's a browser request, use inline to view instead of download
+        inline_view = sub_settings.disable_sub_template and is_browser_request
+        response_headers = self.create_response_headers(
+            user,
+            request_url,
+            sub_settings,
+            inline=inline_view,
+            extra_headers={},
+        )
+        try:
+            rule_vars = await self._get_rule_response_header_variables(user, client_type)
+            response_headers.update(self._format_subscription_response_headers(sub_settings, rule_vars))
+
+            rule_headers = self._format_rule_response_headers(matched_rule, rule_vars)
+            apply_to_end = bool(
+                matched_rule.response_modifications and matched_rule.response_modifications.apply_headers_to_end
             )
-            try:
-                response_headers.update(
-                    self._format_subscription_response_headers(
-                        sub_settings, await self._get_rule_response_header_variables(user, client_type)
-                    )
-                )
-                response_headers.update(
-                    self._format_rule_response_headers(
-                        matched_rule, await self._get_rule_response_header_variables(user, client_type)
-                    )
-                )
-                response_headers = self.sanitize_response_headers(response_headers)
-            except ValueError as exc:
-                await self.raise_error(message=str(exc), code=400)
+            if not apply_to_end:
+                response_headers.update(rule_headers)
 
-            config = client_config.get(client_type, {})
-            if "media_type" in config:
-                response_headers["content-type"] = config["media_type"]
+            response_headers = self.sanitize_response_headers(response_headers)
+
+            if apply_to_end:
+                response_headers.update(self.sanitize_response_headers(rule_headers))
+        except ValueError as exc:
+            await self.raise_error(message=str(exc), code=400)
+
+        config = client_config.get(client_type, {})
+        if "media_type" in config:
+            response_headers["content-type"] = config["media_type"]
 
         return response_headers
 

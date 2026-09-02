@@ -282,3 +282,32 @@ async def remove_client_templates(db: AsyncSession, template_ids: list[int]) -> 
 
     await db.execute(delete(ClientTemplate).where(ClientTemplate.id.in_(template_ids)))
     await db.commit()
+
+
+async def get_all_client_templates_map(db: AsyncSession) -> dict[str, dict[str, str]]:
+    """
+    Returns templates organized by template_type:
+    {
+        template_type_str: {
+            "by_name": {name_lower: content, original_name: content},
+            "by_id": {str(id): content}
+        }
+    }
+    """
+    try:
+        rows = (
+            await db.execute(
+                select(ClientTemplate.id, ClientTemplate.name, ClientTemplate.template_type, ClientTemplate.content)
+            )
+        ).all()
+    except SQLAlchemyError:
+        return {}
+
+    result: dict[str, dict[str, str]] = {}
+    for row in rows:
+        type_entry = result.setdefault(row.template_type, {"by_name": {}, "by_id": {}})
+        type_entry["by_name"][row.name.lower()] = row.content
+        type_entry["by_name"][row.name] = row.content
+        type_entry["by_id"][str(row.id)] = row.content
+
+    return result

@@ -33,6 +33,7 @@ SERVER_IPV6 = "[::1]"
 def _build_subscription_config(
     config_format: str,
     client_templates: dict[str, str],
+    custom_template_content: str | None = None,
 ) -> (
     StandardLinks
     | XrayConfiguration
@@ -52,17 +53,17 @@ def _build_subscription_config(
         return StandardLinks(**common_kwargs)
     if config_format == "clash":
         return ClashConfiguration(
-            clash_template_content=client_templates["CLASH_SUBSCRIPTION_TEMPLATE"],
+            clash_template_content=custom_template_content or client_templates["CLASH_SUBSCRIPTION_TEMPLATE"],
             **common_kwargs,
         )
     if config_format == "clash_meta":
         return ClashMetaConfiguration(
-            clash_template_content=client_templates["CLASH_SUBSCRIPTION_TEMPLATE"],
+            clash_template_content=custom_template_content or client_templates["CLASH_SUBSCRIPTION_TEMPLATE"],
             **common_kwargs,
         )
     if config_format == "sing_box":
         return SingBoxConfiguration(
-            singbox_template_content=client_templates["SINGBOX_SUBSCRIPTION_TEMPLATE"],
+            singbox_template_content=custom_template_content or client_templates["SINGBOX_SUBSCRIPTION_TEMPLATE"],
             **common_kwargs,
         )
     if config_format == "outline":
@@ -71,7 +72,7 @@ def _build_subscription_config(
         return WireGuardConfiguration()
     if config_format == "xray":
         return XrayConfiguration(
-            xray_template_content=client_templates["XRAY_SUBSCRIPTION_TEMPLATE"],
+            xray_template_content=custom_template_content or client_templates["XRAY_SUBSCRIPTION_TEMPLATE"],
             **common_kwargs,
         )
     return None
@@ -82,10 +83,14 @@ async def generate_subscription(
     config_format: str,
     as_base64: bool,
     randomize_order: bool = False,
+    custom_template_content: str | None = None,
+    ignore_host_xray_template: bool = False,
 ) -> str | bytes:
     client_templates = await subscription_client_templates()
-    xray_template_overrides = await subscription_xray_templates() if config_format == "xray" else None
-    conf = _build_subscription_config(config_format, client_templates)
+    xray_template_overrides = (
+        await subscription_xray_templates() if (config_format == "xray" and not ignore_host_xray_template) else None
+    )
+    conf = _build_subscription_config(config_format, client_templates, custom_template_content)
     if conf is None:
         raise ValueError(f'Unsupported format "{config_format}"')
 
