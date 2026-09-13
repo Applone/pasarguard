@@ -117,16 +117,21 @@ export const subscriptionSchema = z.object({
       conditions: z
         .array(
           z.object({
-            headerName: z.string().min(1, 'Header name is required'),
+            headerName: z
+              .string()
+              .min(1, 'Header name is required')
+              .max(100)
+              // RFC 7230 token: header names cannot contain separators or whitespace.
+              .regex(/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/, 'Not a valid HTTP header name'),
             operator: z.enum(['EQUALS', 'NOT_EQUALS', 'CONTAINS', 'NOT_CONTAINS', 'STARTS_WITH', 'NOT_STARTS_WITH', 'ENDS_WITH', 'NOT_ENDS_WITH', 'REGEX', 'NOT_REGEX']).default('CONTAINS'),
-            value: z.string().default(''),
+            value: z.string().min(1, 'Condition value is required').max(255).default(''),
             caseSensitive: z.boolean().default(false),
           }),
         )
         .default([]),
-      responseType: z
-        .enum(['MIHOMO', 'CLASH', 'STASH', 'SINGBOX', 'XRAY_JSON', 'XRAY_BASE64', 'LINKS', 'WIREGUARD', 'OUTLINE', 'BROWSER', 'BLOCK', 'STATUS_CODE_404', 'STATUS_CODE_451', 'SOCKET_DROP'])
-        .default('XRAY_BASE64'),
+      // Either a built-in response type or a reference to a Client Template
+      // ("TEMPLATE:<id>", or a bare template name/id that the API canonicalizes on save).
+      responseType: z.string().min(1, 'Response type is required').max(128).default('XRAY_BASE64'),
       responseModifications: z
         .object({
           subscriptionTemplate: z.string().nullable().optional(),

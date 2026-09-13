@@ -1,6 +1,7 @@
 import re
+from dataclasses import dataclass
 from json import dumps as json_dumps
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from fastapi import Request, Response
 from fastapi.responses import HTMLResponse
@@ -17,6 +18,7 @@ from app.models.admin import AdminDetails
 from app.models.client_template import ClientTemplateType
 from app.models.settings import (
     RESPONSE_TYPE_TO_CONFIG_FORMAT,
+    TEMPLATE_TYPE_TO_CONFIG_FORMAT,
     Application,
     ConditionOperator,
     ConfigFormat,
@@ -32,7 +34,7 @@ from app.models.stats import UserUsageStatsList
 from app.models.subscription import SubscriptionUsageQuery
 from app.models.user import SubscriptionUserResponse, UsersResponseWithInbounds
 from app.settings import hwid_settings, subscription_settings
-from app.subscription.client_templates import resolve_client_template_content
+from app.subscription.client_templates import resolve_client_template_content, resolve_response_template
 from app.subscription.share import (
     apply_custom_format_variables,
     encode_title,
@@ -176,6 +178,101 @@ def match_rule(rule: SubRule, headers: dict[str, str]) -> bool:
     return False
 
 
+# Response types that terminate the request with a bare status code, and the body they
+# carry on GET. Shared by the body and headers paths so the two can never disagree.
+STATUS_ONLY_RESPONSES: dict[str, tuple[int, str]] = {
+    ResponseType.BLOCK.value: (403, "Forbidden"),
+    ResponseType.STATUS_CODE_404.value: (404, "Not Found"),
+    ResponseType.STATUS_CODE_451.value: (451, "Unavailable For Legal Reasons"),
+}
+
+
+@dataclass(slots=True)
+class ResolvedRuleResponse:
+    """
+    What a matched rule resolves to, independent of whether the caller needs a body.
+
+    kind:
+      - "page"          render the browser subscription page
+      - "status"        terminate with status_code / body
+      - "socket_drop"   abort the connection without a reply
+      - "unsupported"   no renderable format (406)
+      - "config"        render client_type, optionally with template_content
+    """
+
+    kind: Literal["page", "status", "socket_drop", "unsupported", "config"]
+    status_code: int | None = None
+    body: str | None = None
+    client_type: ConfigFormat | None = None
+    template_content: str | None = None
+
+
+def drop_socket(request: Request | None) -> Response:
+    """Abort the underlying connection, falling back to a bare non-response."""
+    if request is not None and "transport" in request.scope:
+        try:
+            request.scope["transport"].abort()
+        except Exception:
+            try:
+                request.scope["transport"].close()
+            except Exception:
+                pass
+    return Response(status_code=444, headers={"Connection": "close"})
+
+
+async def resolve_rule_response(rule: SubRule) -> ResolvedRuleResponse:
+    """
+    Resolve a matched rule's response type into a concrete action.
+
+    A response type is either a built-in generator/behavior token or a reference to a
+    Client Template. For a template reference the output format is implied by the
+    template's own type, and the template content is returned so the generator renders
+    it instead of the configured default.
+    """
+    resp_type = rule.response_type
+
+    if resp_type == ResponseType.BROWSER.value:
+        return ResolvedRuleResponse(kind="page")
+    if resp_type in STATUS_ONLY_RESPONSES:
+        status_code, body = STATUS_ONLY_RESPONSES[resp_type]
+        return ResolvedRuleResponse(kind="status", status_code=status_code, body=body)
+    if resp_type == ResponseType.SOCKET_DROP.value:
+        return ResolvedRuleResponse(kind="socket_drop")
+
+    template_content: str | None = None
+    if rule.is_builtin_response:
+        client_type = RESPONSE_TYPE_TO_CONFIG_FORMAT.get(resp_type, rule.target)
+    else:
+        template = await resolve_response_template(rule.template_reference)
+        if template is None:
+            # The referenced template was deleted or renamed. Failing closed is safer
+            # than silently serving a different format than the operator configured.
+            return ResolvedRuleResponse(kind="unsupported")
+        client_type = TEMPLATE_TYPE_TO_CONFIG_FORMAT.get(template.template_type)
+        template_content = template.content
+
+    if client_type == ConfigFormat.block or not client_type:
+        return ResolvedRuleResponse(kind="unsupported")
+
+    # An explicit subscriptionTemplate override wins over the template implied by the
+    # response type, matching the reference behavior where the override is the most
+    # specific instruction on the rule.
+    override_name = rule.response_modifications.subscription_template if rule.response_modifications else None
+    if override_name:
+        template_type_map = {
+            ConfigFormat.xray: ClientTemplateType.xray_subscription,
+            ConfigFormat.sing_box: ClientTemplateType.singbox_subscription,
+            ConfigFormat.clash: ClientTemplateType.clash_subscription,
+            ConfigFormat.clash_meta: ClientTemplateType.clash_subscription,
+        }
+        if client_type in template_type_map:
+            override_content = await resolve_client_template_content(template_type_map[client_type], override_name)
+            if override_content is not None:
+                template_content = override_content
+
+    return ResolvedRuleResponse(kind="config", client_type=client_type, template_content=template_content)
+
+
 class SubscriptionOperation(BaseOperation):
     _ENCODED_RULE_RESPONSE_HEADERS: ClassVar[set[str]] = {"announce", "profile-title"}
 
@@ -192,9 +289,10 @@ class SubscriptionOperation(BaseOperation):
     async def detect_client_type(headers_or_user_agent: Any, rules: list[SubRule]) -> ConfigFormat | None:
         """Detect the appropriate client configuration format based on the headers or user agent."""
         rule = SubscriptionOperation.detect_client_rule(headers_or_user_agent, rules)
-        if rule:
-            return rule.target
-        return None
+        if not rule:
+            return None
+        resolved = await resolve_rule_response(rule)
+        return resolved.client_type if resolved.kind == "config" else None
 
     @staticmethod
     def detect_client_rule(headers_or_user_agent: Any, rules: list[SubRule]) -> SubRule | None:
@@ -572,11 +670,11 @@ class SubscriptionOperation(BaseOperation):
 
         # Match rule from subscription rules
         matched_rule = self.detect_client_rule(headers_map, sub_settings.rules)
+        resolved = await resolve_rule_response(matched_rule) if matched_rule is not None else None
 
         is_subscription_page = False
-        if matched_rule is not None:
-            if matched_rule.response_type == ResponseType.BROWSER:
-                is_subscription_page = True
+        if resolved is not None:
+            is_subscription_page = resolved.kind == "page"
         elif is_browser_request and not sub_settings.disable_sub_template:
             is_subscription_page = True
 
@@ -611,32 +709,17 @@ class SubscriptionOperation(BaseOperation):
                 )
             )
 
-        if not matched_rule:
+        if not matched_rule or resolved is None:
             await self.raise_error(message="Client not supported", code=406)
 
-        resp_type = matched_rule.response_type
-
-        # Handle special Remnawave response types
-        if resp_type == ResponseType.BLOCK:
-            return Response(content="Forbidden", status_code=403)
-        if resp_type == ResponseType.STATUS_CODE_404:
-            return Response(content="Not Found", status_code=404)
-        if resp_type == ResponseType.STATUS_CODE_451:
-            return Response(content="Unavailable For Legal Reasons", status_code=451)
-        if resp_type == ResponseType.SOCKET_DROP:
-            if request is not None and "transport" in request.scope:
-                try:
-                    request.scope["transport"].abort()
-                except Exception:
-                    try:
-                        request.scope["transport"].close()
-                    except Exception:
-                        pass
-            return Response(status_code=444, headers={"Connection": "close"})
-
-        client_type = RESPONSE_TYPE_TO_CONFIG_FORMAT.get(resp_type.value, matched_rule.target)
-        if client_type == ConfigFormat.block or not client_type:
+        if resolved.kind == "status":
+            return Response(content=resolved.body, status_code=resolved.status_code)
+        if resolved.kind == "socket_drop":
+            return drop_socket(request)
+        if resolved.kind != "config":
             await self.raise_error(message="Client not supported", code=406)
+
+        client_type = resolved.client_type
 
         # Check HWID enforcement unless disabled in rule
         disable_hwid = bool(
@@ -657,22 +740,9 @@ class SubscriptionOperation(BaseOperation):
         # Update user subscription info
         await user_sub_update(db, db_user.id, effective_user_agent, ip=ip, hwid=headers_map.get("x-hwid"))
 
-        # Resolve custom template if specified
-        custom_template_content = None
-        sub_template_name = (
-            matched_rule.response_modifications.subscription_template if matched_rule.response_modifications else None
-        )
-        if sub_template_name:
-            template_type_map = {
-                ConfigFormat.xray: ClientTemplateType.xray_subscription,
-                ConfigFormat.sing_box: ClientTemplateType.singbox_subscription,
-                ConfigFormat.clash: ClientTemplateType.clash_subscription,
-                ConfigFormat.clash_meta: ClientTemplateType.clash_subscription,
-            }
-            if client_type in template_type_map:
-                custom_template_content = await resolve_client_template_content(
-                    template_type_map[client_type], sub_template_name
-                )
+        # Template content was already resolved from the response type and any
+        # subscriptionTemplate override.
+        custom_template_content = resolved.template_content
 
         ignore_host_xray = bool(
             matched_rule.response_modifications and matched_rule.response_modifications.ignore_host_xray_json_template
@@ -951,9 +1021,12 @@ class SubscriptionOperation(BaseOperation):
         request_url: str = "",
         request: Request | None = None,
         request_headers: dict[str, str] | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, str] | Response:
         """
         Retrieves only the headers for a subscription request, bypassing configuration generation.
+
+        Returns a ready Response when the matched rule terminates the request (status-only
+        response types and socket drop), otherwise a header map for the caller to attach.
         """
         sub_settings: SubSettings = await subscription_settings()
         db_user = await self.get_validated_sub(db, token, load_admin_role=True)
@@ -974,11 +1047,11 @@ class SubscriptionOperation(BaseOperation):
         is_browser_request = "text/html" in effective_accept
 
         matched_rule = self.detect_client_rule(headers_map, sub_settings.rules)
+        resolved = await resolve_rule_response(matched_rule) if matched_rule is not None else None
 
         is_subscription_page = False
-        if matched_rule is not None:
-            if matched_rule.response_type == ResponseType.BROWSER:
-                is_subscription_page = True
+        if resolved is not None:
+            is_subscription_page = resolved.kind == "page"
         elif is_browser_request and not sub_settings.disable_sub_template:
             is_subscription_page = True
 
@@ -987,20 +1060,18 @@ class SubscriptionOperation(BaseOperation):
                 "content-type": "text/html; charset=utf-8",
             }
 
-        if not matched_rule:
+        if not matched_rule or resolved is None:
             await self.raise_error(message="Client not supported", code=406)
 
-        resp_type = matched_rule.response_type
-        if resp_type == ResponseType.BLOCK:
-            await self.raise_error(message="Forbidden", code=403)
-        if resp_type == ResponseType.STATUS_CODE_404:
-            await self.raise_error(message="Not Found", code=404)
-        if resp_type == ResponseType.STATUS_CODE_451:
-            await self.raise_error(message="Unavailable For Legal Reasons", code=451)
-
-        client_type = RESPONSE_TYPE_TO_CONFIG_FORMAT.get(resp_type.value, matched_rule.target)
-        if client_type == ConfigFormat.block or not client_type:
+        # Special response types must behave identically on HEAD and GET.
+        if resolved.kind == "status":
+            return Response(status_code=resolved.status_code)
+        if resolved.kind == "socket_drop":
+            return drop_socket(request)
+        if resolved.kind != "config":
             await self.raise_error(message="Client not supported", code=406)
+
+        client_type = resolved.client_type
 
         # If disable_sub_template is True and it's a browser request, use inline to view instead of download
         inline_view = sub_settings.disable_sub_template and is_browser_request

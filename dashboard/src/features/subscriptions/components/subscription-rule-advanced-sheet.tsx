@@ -3,7 +3,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -13,7 +13,7 @@ import useDirDetection from '@/hooks/use-dir-detection'
 import { useIsMobile } from '@/hooks/use-mobile'
 import { cn } from '@/lib/utils'
 import { useGetClientTemplatesSimple } from '@/service/api'
-import { commonHeaderSuggestions, conditionOperatorOptions, responseTypeOptions } from './config-format-options'
+import { commonHeaderSuggestions, conditionOperatorOptions, templateTypeLabel, useResponseTypeOptions } from './config-format-options'
 import type { SubscriptionFormData } from './subscription-settings-schema'
 import { Info, Plus, SlidersHorizontal, Trash2 } from 'lucide-react'
 import { useMemo } from 'react'
@@ -38,6 +38,9 @@ export function SubscriptionRuleAdvancedSheet({ form, ruleIndex, rowId, open, on
   const { data: templatesData } = useGetClientTemplatesSimple({ all: true }, { query: { enabled: open } })
   const templates = useMemo(() => templatesData?.templates ?? [], [templatesData?.templates])
 
+  // Response types are the built-ins plus every Client Template.
+  const { builtins: responseTypeBuiltins, templates: responseTypeTemplates, resolve: resolveResponseType } = useResponseTypeOptions(open)
+
   const rule = form.watch(`rules.${ruleIndex}`)
   const conditions = rule?.conditions || []
   const modifications = rule?.responseModifications || {
@@ -48,6 +51,7 @@ export function SubscriptionRuleAdvancedSheet({ form, ruleIndex, rowId, open, on
     ignoreServeJsonAtBaseSubscription: false,
     disableHwidCheck: false,
   }
+  const selectedResponseType = resolveResponseType(rule?.responseType)
   const headers = modifications.headers || []
 
   const addCondition = () => {
@@ -248,21 +252,64 @@ export function SubscriptionRuleAdvancedSheet({ form, ruleIndex, rowId, open, on
             <TabsContent value="response" className="mt-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-1">
               <div className="space-y-1.5">
                 <Label className="text-xs font-medium">{t('settings.subscriptions.rules.responseType', { defaultValue: 'Response Type' })}</Label>
-                <Select value={rule?.responseType || 'XRAY_BASE64'} onValueChange={val => form.setValue(`rules.${ruleIndex}.responseType`, val as any, { shouldDirty: true })}>
+                <Select value={selectedResponseType?.value || 'XRAY_BASE64'} onValueChange={val => form.setValue(`rules.${ruleIndex}.responseType`, val, { shouldDirty: true })}>
                   <SelectTrigger className="h-9 text-xs">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent className="max-h-72">
-                    {responseTypeOptions.map(option => (
-                      <SelectItem key={option.value} value={option.value}>
-                        <div className="flex items-center gap-2">
-                          <option.icon className="text-muted-foreground h-4 w-4 shrink-0" />
-                          <span>{option.label}</span>
-                        </div>
-                      </SelectItem>
-                    ))}
+                    <SelectGroup>
+                      <SelectLabel className="text-[10px] tracking-wide uppercase">{t('settings.subscriptions.rules.builtinTypes', { defaultValue: 'Built-in' })}</SelectLabel>
+                      {responseTypeBuiltins.map(option => (
+                        <SelectItem key={option.value} value={option.value}>
+                          <div className="flex items-center gap-2">
+                            <option.icon className="text-muted-foreground h-4 w-4 shrink-0" />
+                            <span>{option.label}</span>
+                          </div>
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                    {responseTypeTemplates.length > 0 && (
+                      <SelectGroup>
+                        <SelectLabel className="text-[10px] tracking-wide uppercase">{t('settings.subscriptions.rules.clientTemplates', { defaultValue: 'Client Templates' })}</SelectLabel>
+                        {responseTypeTemplates.map(option => (
+                          <SelectItem key={option.value} value={option.value}>
+                            <div className="flex items-center gap-2">
+                              <option.icon className="text-muted-foreground h-4 w-4 shrink-0" />
+                              <span>{option.label}</span>
+                              {templateTypeLabel(option.templateType) && <span className="text-muted-foreground text-[10px]">({templateTypeLabel(option.templateType)})</span>}
+                            </div>
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    )}
+                    {selectedResponseType?.missing && (
+                      <SelectGroup>
+                        <SelectLabel className="text-destructive text-[10px] tracking-wide uppercase">
+                          {t('settings.subscriptions.rules.missingTemplate', { defaultValue: 'Missing template' })}
+                        </SelectLabel>
+                        <SelectItem value={selectedResponseType.value}>
+                          <div className="flex items-center gap-2">
+                            <selectedResponseType.icon className="text-destructive h-4 w-4 shrink-0" />
+                            <span>{selectedResponseType.label}</span>
+                          </div>
+                        </SelectItem>
+                      </SelectGroup>
+                    )}
                   </SelectContent>
                 </Select>
+                {selectedResponseType?.missing ? (
+                  <p className="text-destructive text-[11px]">
+                    {t('settings.subscriptions.rules.missingTemplateHint', {
+                      defaultValue: 'This client template no longer exists. Pick another response type — saving will fail until you do.',
+                    })}
+                  </p>
+                ) : (
+                  <p className="text-muted-foreground text-[11px]">
+                    {t('settings.subscriptions.rules.responseTypeHint', {
+                      defaultValue: 'Built-in formats and behaviors, plus every template from Client Templates.',
+                    })}
+                  </p>
+                )}
               </div>
 
               <div className="space-y-1.5">

@@ -1408,7 +1408,14 @@ export interface SubRule {
   enabled?: boolean
   operator?: RuleOperator
   conditions?: RuleCondition[]
-  responseType?: ResponseType
+  /**
+   * Either a built-in `ResponseType` token or a Client Template reference in the
+   * canonical `TEMPLATE:<id>` form. A bare template name or id is also accepted and is
+   * canonicalized on save.
+   * @minLength 1
+   * @maxLength 128
+   */
+  responseType?: string
   responseModifications?: ResponseModifications
 }
 
@@ -1659,6 +1666,10 @@ export interface RoleAccess {
   allowed_group_ids?: RoleAccessAllowedGroupIds
 }
 
+/**
+ * The built-in response types. A rule's `responseType` may also reference any Client
+ * Template, so this is the built-in registry rather than the full set of valid values.
+ */
 export type ResponseType = (typeof ResponseType)[keyof typeof ResponseType]
 
 // eslint-disable-next-line @typescript-eslint/no-redeclare

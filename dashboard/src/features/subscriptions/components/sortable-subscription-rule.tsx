@@ -1,11 +1,11 @@
-import { responseTypeOptions } from '@/features/subscriptions/components/config-format-options'
+import { useResponseTypeOptions } from '@/features/subscriptions/components/config-format-options'
 import { SubscriptionRuleAdvancedSheet } from '@/features/subscriptions/components/subscription-rule-advanced-sheet'
 import type { SubscriptionFormData } from '@/features/subscriptions/components/subscription-settings-schema'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
@@ -32,6 +32,10 @@ export function SortableSubscriptionRule({ index, onRemove, form, id }: Sortable
   const customTemplate = rule?.responseModifications?.subscriptionTemplate
   const headerCount = (rule?.responseModifications?.headers || []).length
   const isEnabled = rule?.enabled ?? true
+
+  // Built-in response types plus every Client Template configured in the panel.
+  const { builtins, templates, resolve } = useResponseTypeOptions()
+  const selectedOption = resolve(rule?.responseType)
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -115,14 +119,45 @@ export function SortableSubscriptionRule({ index, onRemove, form, id }: Sortable
                           </SelectTrigger>
                         </FormControl>
                         <SelectContent dir="ltr" className="z-[50] max-h-72 scrollbar-thin">
-                          {responseTypeOptions.map(option => (
-                            <SelectItem key={option.value} value={option.value}>
-                              <div className="flex items-center gap-1.5">
-                                <option.icon className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
-                                <span className="text-xs">{option.label}</span>
-                              </div>
-                            </SelectItem>
-                          ))}
+                          <SelectGroup>
+                            <SelectLabel className="text-[10px] tracking-wide uppercase">{t('settings.subscriptions.rules.builtinTypes', { defaultValue: 'Built-in' })}</SelectLabel>
+                            {builtins.map(option => (
+                              <SelectItem key={option.value} value={option.value}>
+                                <div className="flex items-center gap-1.5">
+                                  <option.icon className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
+                                  <span className="text-xs">{option.label}</span>
+                                </div>
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                          {templates.length > 0 && (
+                            <SelectGroup>
+                              <SelectLabel className="text-[10px] tracking-wide uppercase">{t('settings.subscriptions.rules.clientTemplates', { defaultValue: 'Client Templates' })}</SelectLabel>
+                              {templates.map(option => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  <div className="flex items-center gap-1.5">
+                                    <option.icon className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
+                                    <span className="text-xs">{option.label}</span>
+                                  </div>
+                                </SelectItem>
+                              ))}
+                            </SelectGroup>
+                          )}
+                          {/* A rule may point at a template that has since been deleted. Keep the
+                              value selectable so the select is not silently blank. */}
+                          {selectedOption?.missing && (
+                            <SelectGroup>
+                              <SelectLabel className="text-destructive text-[10px] tracking-wide uppercase">
+                                {t('settings.subscriptions.rules.missingTemplate', { defaultValue: 'Missing template' })}
+                              </SelectLabel>
+                              <SelectItem value={selectedOption.value}>
+                                <div className="flex items-center gap-1.5">
+                                  <selectedOption.icon className="text-destructive h-3.5 w-3.5 shrink-0" />
+                                  <span className="text-xs">{selectedOption.label}</span>
+                                </div>
+                              </SelectItem>
+                            </SelectGroup>
+                          )}
                         </SelectContent>
                       </Select>
                       <FormMessage />

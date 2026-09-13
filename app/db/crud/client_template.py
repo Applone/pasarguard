@@ -311,3 +311,52 @@ async def get_all_client_templates_map(db: AsyncSession) -> dict[str, dict[str, 
         type_entry["by_id"][str(row.id)] = row.content
 
     return result
+
+
+# Client template types that can back a subscription response body. `user_agent` and
+# `grpc_user_agent` templates are node-side data, not renderable subscription output,
+# so they are never selectable as a response type.
+RESPONSE_TEMPLATE_TYPES: tuple[ClientTemplateType, ...] = (
+    ClientTemplateType.xray_subscription,
+    ClientTemplateType.singbox_subscription,
+    ClientTemplateType.clash_subscription,
+)
+
+
+async def get_response_templates(db: AsyncSession) -> list[dict]:
+    """
+    Return every client template that can be used as a subscription response type.
+
+    Ordered deterministically by template type (xray, sing-box, clash) and then id, so
+    that name-based lookups resolve the same way on every worker.
+    """
+    type_order = {t.value: i for i, t in enumerate(RESPONSE_TEMPLATE_TYPES)}
+    try:
+        rows = (
+            await db.execute(
+                select(
+                    ClientTemplate.id,
+                    ClientTemplate.name,
+                    ClientTemplate.template_type,
+                    ClientTemplate.content,
+                    ClientTemplate.is_default,
+                )
+                .where(ClientTemplate.template_type.in_([t.value for t in RESPONSE_TEMPLATE_TYPES]))
+                .order_by(ClientTemplate.id.asc())
+            )
+        ).all()
+    except SQLAlchemyError:
+        return []
+
+    templates = [
+        {
+            "id": row.id,
+            "name": row.name,
+            "template_type": row.template_type,
+            "content": row.content,
+            "is_default": row.is_default,
+        }
+        for row in rows
+    ]
+    templates.sort(key=lambda t: (type_order.get(t["template_type"], len(type_order)), t["id"]))
+    return templates

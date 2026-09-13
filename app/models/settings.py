@@ -271,6 +271,92 @@ CONFIG_FORMAT_TO_RESPONSE_TYPE: dict[str, ResponseType] = {
     ConfigFormat.block.value: ResponseType.BLOCK,
 }
 
+BUILTIN_RESPONSE_TYPES: frozenset[str] = frozenset(item.value for item in ResponseType)
+
+# Response types that terminate the request without rendering a subscription body.
+SPECIAL_RESPONSE_TYPES: frozenset[str] = frozenset(
+    {
+        ResponseType.BROWSER.value,
+        ResponseType.BLOCK.value,
+        ResponseType.STATUS_CODE_404.value,
+        ResponseType.STATUS_CODE_451.value,
+        ResponseType.SOCKET_DROP.value,
+    }
+)
+
+# A rule's response type may reference a Client Template instead of a built-in
+# generator. The canonical stored form is "TEMPLATE:<id>" so that renaming a template
+# in the panel does not silently break rules, and so a template named e.g. "CLASH"
+# can never shadow a built-in response type.
+RESPONSE_TEMPLATE_PREFIX = "TEMPLATE:"
+
+# The output format implied by a template-backed response type. Clash templates render
+# as plain Clash; to serve a custom Clash template through the Mihomo generator, select
+# the MIHOMO built-in and set responseModifications.subscriptionTemplate instead.
+TEMPLATE_TYPE_TO_CONFIG_FORMAT: dict[str, ConfigFormat] = {
+    "xray_subscription": ConfigFormat.xray,
+    "singbox_subscription": ConfigFormat.sing_box,
+    "clash_subscription": ConfigFormat.clash,
+}
+
+
+def is_builtin_response_type(value: str) -> bool:
+    """True when the response type is one of the built-in generators or behaviors."""
+    return str(value).strip().upper() in BUILTIN_RESPONSE_TYPES
+
+
+def response_template_reference(value: str) -> str | None:
+    """
+    Return the template reference carried by a response type, or None for built-ins.
+
+    The reference is either a numeric template id or a template name; both are resolved
+    asynchronously against the Client Templates table.
+    """
+    raw = str(value).strip()
+    if not raw or is_builtin_response_type(raw):
+        return None
+    if raw.upper().startswith(RESPONSE_TEMPLATE_PREFIX):
+        reference = raw[len(RESPONSE_TEMPLATE_PREFIX) :].strip()
+        return reference or None
+    # A bare value that is not a built-in is treated as a template name or id. It is
+    # canonicalized to TEMPLATE:<id> on write, but is still accepted on read so that
+    # hand-written API payloads and pre-canonicalization data keep working.
+    return raw
+
+
+def normalize_response_type(value: Any) -> Any:
+    """
+    Coerce any accepted response-type spelling into its canonical stored form.
+
+    Accepts built-in tokens in any case, legacy ConfigFormat names ("links_base64"),
+    ConfigFormat members, and template references ("TEMPLATE:7", "7", "Happ Android").
+    """
+    if isinstance(value, ConfigFormat):
+        return CONFIG_FORMAT_TO_RESPONSE_TYPE.get(value.value, ResponseType.XRAY_BASE64).value
+    if isinstance(value, ResponseType):
+        return value.value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{RESPONSE_TEMPLATE_PREFIX}{value}"
+    if not isinstance(value, str):
+        return value
+
+    raw = value.strip()
+    if not raw:
+        return ResponseType.XRAY_BASE64.value
+
+    upper = raw.upper()
+    if upper in BUILTIN_RESPONSE_TYPES:
+        return upper
+    if raw.lower() in CONFIG_FORMAT_TO_RESPONSE_TYPE:
+        return CONFIG_FORMAT_TO_RESPONSE_TYPE[raw.lower()].value
+    if upper.startswith(RESPONSE_TEMPLATE_PREFIX):
+        reference = raw[len(RESPONSE_TEMPLATE_PREFIX) :].strip()
+        return f"{RESPONSE_TEMPLATE_PREFIX}{reference}" if reference else ResponseType.XRAY_BASE64.value
+    if raw.isdigit():
+        return f"{RESPONSE_TEMPLATE_PREFIX}{raw}"
+    # Bare template name: kept verbatim so it can be resolved by name.
+    return raw
+
 
 class RuleCondition(BaseModel):
     header_name: str = Field(
@@ -341,15 +427,17 @@ class ResponseModifications(BaseModel):
 
 
 class SubRule(BaseModel):
-    name: str = Field(default="", max_length=100)
+    name: str = Field(default="", max_length=50)
     description: str = Field(default="", max_length=250)
     enabled: bool = Field(default=True)
     operator: RuleOperator = Field(default=RuleOperator.AND)
     conditions: list[RuleCondition] = Field(default_factory=list)
-    response_type: ResponseType = Field(
-        default=ResponseType.XRAY_BASE64,
+    response_type: str = Field(
+        default=ResponseType.XRAY_BASE64.value,
         validation_alias=AliasChoices("responseType", "response_type"),
         serialization_alias="responseType",
+        min_length=1,
+        max_length=128,
     )
     response_modifications: ResponseModifications = Field(
         default_factory=ResponseModifications,
@@ -361,19 +449,23 @@ class SubRule(BaseModel):
 
     @field_validator("response_type", mode="before")
     @classmethod
-    def normalize_response_type(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            val_strip = value.strip()
-            val_upper = val_strip.upper()
-            try:
-                return ResponseType(val_upper)
-            except ValueError:
-                pass
-            if val_strip.lower() in CONFIG_FORMAT_TO_RESPONSE_TYPE:
-                return CONFIG_FORMAT_TO_RESPONSE_TYPE[val_strip.lower()]
-        elif isinstance(value, ConfigFormat):
-            return CONFIG_FORMAT_TO_RESPONSE_TYPE.get(value.value, ResponseType.XRAY_BASE64)
-        return value
+    def normalize_response_type_field(cls, value: Any) -> Any:
+        return normalize_response_type(value)
+
+    @field_validator("name", "description", mode="before")
+    @classmethod
+    def truncate_text_fields(cls, value: Any, info) -> Any:
+        """
+        Clamp instead of reject.
+
+        These bounds are tightened to match the reference spec, and settings are
+        re-validated on every read, so rejecting an over-long stored value would make
+        the panel unloadable rather than merely flagging a bad rule.
+        """
+        if not isinstance(value, str):
+            return value
+        limit = 50 if info.field_name == "name" else 250
+        return value[:limit]
 
     @field_validator("operator", mode="before")
     @classmethod
@@ -405,7 +497,7 @@ class SubRule(BaseModel):
                     name = f"Rule: {pattern}"[:50]
                 else:
                     name = "Legacy Rule"
-            data["name"] = str(name)[:100]
+            data["name"] = str(name)[:50]
             conditions = data.get("conditions")
             if conditions is None and pattern is not None:
                 conditions = [
@@ -434,10 +526,26 @@ class SubRule(BaseModel):
                 return cond.value
         return self.conditions[0].value if self.conditions else ".*"
 
+    @property
+    def is_builtin_response(self) -> bool:
+        return is_builtin_response_type(self.response_type)
+
+    @property
+    def template_reference(self) -> str | None:
+        """The Client Template this rule responds with, or None for built-in types."""
+        return response_template_reference(self.response_type)
+
     @computed_field
     @property
     def target(self) -> ConfigFormat:
-        return RESPONSE_TYPE_TO_CONFIG_FORMAT.get(self.response_type.value, ConfigFormat.links_base64)
+        """
+        Best-effort synchronous output format.
+
+        Template-backed response types need a database lookup to know their format, so
+        the authoritative resolution lives in SubscriptionOperation.resolve_rule_response.
+        This stays a safe fallback for the legacy `target` field kept in the API schema.
+        """
+        return RESPONSE_TYPE_TO_CONFIG_FORMAT.get(self.response_type, ConfigFormat.links_base64)
 
     @computed_field
     @property

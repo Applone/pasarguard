@@ -288,3 +288,225 @@ def test_format_rule_response_headers_list_and_dict():
     headers_dict = SubscriptionOperation._format_rule_response_headers(rule_dict, {"USERNAME": "alice"})
     assert headers_dict["X-Provider"] == "MyProvider"
     assert headers_dict["X-User"] == "alice"
+
+
+# --- Response types backed by Client Templates -------------------------------------
+
+
+def test_builtin_response_type_normalization():
+    """Built-in tokens, legacy ConfigFormat names and ConfigFormat members all canonicalize."""
+    assert SubRule(responseType="xray_json").response_type == "XRAY_JSON"
+    assert SubRule(responseType="  singbox ").response_type == "SINGBOX"
+    assert SubRule(responseType="links_base64").response_type == "XRAY_BASE64"
+    assert SubRule(responseType="clash_meta").response_type == "MIHOMO"
+    assert SubRule(responseType=ConfigFormat.wireguard).response_type == "WIREGUARD"
+    assert SubRule(responseType=ResponseType.SOCKET_DROP).response_type == "SOCKET_DROP"
+    # An empty value falls back to the default rather than producing an invalid rule.
+    assert SubRule(responseType="").response_type == "XRAY_BASE64"
+
+    for rule in (SubRule(responseType="XRAY_JSON"), SubRule(responseType="block")):
+        assert rule.is_builtin_response is True
+        assert rule.template_reference is None
+
+
+def test_template_response_type_references():
+    """Any Client Template is a valid response type, in canonical or bare form."""
+    canonical = SubRule(responseType="TEMPLATE:7")
+    assert canonical.response_type == "TEMPLATE:7"
+    assert canonical.is_builtin_response is False
+    assert canonical.template_reference == "7"
+
+    # A bare numeric id is canonicalized.
+    assert SubRule(responseType="7").response_type == "TEMPLATE:7"
+    assert SubRule(responseType=7).response_type == "TEMPLATE:7"
+
+    # A bare name is preserved verbatim for name-based resolution.
+    by_name = SubRule(responseType="Happ Android")
+    assert by_name.response_type == "Happ Android"
+    assert by_name.is_builtin_response is False
+    assert by_name.template_reference == "Happ Android"
+
+    # A template whose name collides with a built-in cannot shadow it.
+    assert SubRule(responseType="CLASH").template_reference is None
+    assert SubRule(responseType="TEMPLATE:CLASH").template_reference == "CLASH"
+
+
+def test_rule_name_is_clamped_not_rejected():
+    """Over-long stored names must not make the settings blob unloadable."""
+    rule = SubRule(name="x" * 80, responseType="LINKS")
+    assert len(rule.name) == 50
+
+
+@pytest.mark.asyncio
+async def test_resolve_rule_response_status_types():
+    from app.operation.subscription import resolve_rule_response
+
+    expected = {
+        "BLOCK": (403, "Forbidden"),
+        "STATUS_CODE_404": (404, "Not Found"),
+        "STATUS_CODE_451": (451, "Unavailable For Legal Reasons"),
+    }
+    for resp_type, (code, body) in expected.items():
+        resolved = await resolve_rule_response(SubRule(responseType=resp_type))
+        assert resolved.kind == "status"
+        assert resolved.status_code == code
+        assert resolved.body == body
+
+    resolved = await resolve_rule_response(SubRule(responseType="SOCKET_DROP"))
+    assert resolved.kind == "socket_drop"
+
+    resolved = await resolve_rule_response(SubRule(responseType="BROWSER"))
+    assert resolved.kind == "page"
+
+
+@pytest.mark.asyncio
+async def test_resolve_rule_response_builtin_config():
+    from app.operation.subscription import resolve_rule_response
+
+    resolved = await resolve_rule_response(SubRule(responseType="SINGBOX"))
+    assert resolved.kind == "config"
+    assert resolved.client_type == ConfigFormat.sing_box
+    assert resolved.template_content is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_rule_response_template_backed():
+    """A template-backed response type derives its format from the template type."""
+    from app.operation.subscription import resolve_rule_response
+    from app.subscription.client_templates import ResolvedResponseTemplate
+
+    cases = {
+        "xray_subscription": ConfigFormat.xray,
+        "singbox_subscription": ConfigFormat.sing_box,
+        "clash_subscription": ConfigFormat.clash,
+    }
+    for template_type, expected_format in cases.items():
+        template = ResolvedResponseTemplate(id=3, name="Custom", template_type=template_type, content="RENDERED")
+        with patch("app.operation.subscription.resolve_response_template", new_callable=AsyncMock) as mock_resolve:
+            mock_resolve.return_value = template
+            resolved = await resolve_rule_response(SubRule(responseType="TEMPLATE:3"))
+
+        assert resolved.kind == "config"
+        assert resolved.client_type == expected_format
+        assert resolved.template_content == "RENDERED"
+
+
+@pytest.mark.asyncio
+async def test_resolve_rule_response_missing_template_fails_closed():
+    """A deleted or renamed template must not silently fall back to another format."""
+    from app.operation.subscription import resolve_rule_response
+
+    with patch("app.operation.subscription.resolve_response_template", new_callable=AsyncMock) as mock_resolve:
+        mock_resolve.return_value = None
+        resolved = await resolve_rule_response(SubRule(responseType="TEMPLATE:404"))
+
+    assert resolved.kind == "unsupported"
+    assert resolved.client_type is None
+
+
+@pytest.mark.asyncio
+async def test_subscription_template_override_beats_response_type_template():
+    from app.operation.subscription import resolve_rule_response
+    from app.subscription.client_templates import ResolvedResponseTemplate
+
+    template = ResolvedResponseTemplate(
+        id=3, name="Custom", template_type="xray_subscription", content="FROM_RESPONSE_TYPE"
+    )
+    rule = SubRule(
+        responseType="TEMPLATE:3",
+        responseModifications=ResponseModifications(subscriptionTemplate="Override"),
+    )
+
+    with (
+        patch("app.operation.subscription.resolve_response_template", new_callable=AsyncMock) as mock_resolve,
+        patch("app.operation.subscription.resolve_client_template_content", new_callable=AsyncMock) as mock_override,
+    ):
+        mock_resolve.return_value = template
+        mock_override.return_value = "FROM_OVERRIDE"
+        resolved = await resolve_rule_response(rule)
+
+    assert resolved.client_type == ConfigFormat.xray
+    assert resolved.template_content == "FROM_OVERRIDE"
+
+
+@pytest.mark.asyncio
+async def test_resolve_response_template_by_id_and_name():
+    from app.subscription.client_templates import resolve_response_template
+
+    rows = [
+        {"id": 1, "name": "Xray Default", "template_type": "xray_subscription", "content": "X", "is_default": True},
+        {"id": 2, "name": "Happ Android", "template_type": "clash_subscription", "content": "C", "is_default": False},
+    ]
+    with patch("app.subscription.client_templates.response_templates", new_callable=AsyncMock) as mock_rows:
+        mock_rows.return_value = rows
+
+        by_id = await resolve_response_template("2")
+        assert by_id is not None and by_id.name == "Happ Android"
+        assert by_id.content == "C"
+
+        by_name = await resolve_response_template("happ android")
+        assert by_name is not None and by_name.id == 2
+
+        assert await resolve_response_template("nope") is None
+        assert await resolve_response_template("99") is None
+        assert await resolve_response_template(None) is None
+        assert await resolve_response_template("  ") is None
+
+
+# --- Migration: canonicalizing stored response types --------------------------------
+
+
+def _load_canonicalize_migration():
+    import importlib.util
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "app/db/migrations/versions/c4e8a91d5f37_canonicalize_response_type_template_refs.py"
+    )
+    spec = importlib.util.spec_from_file_location("srr_canonicalize_migration", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_migration_canonicalizes_response_types():
+    migration = _load_canonicalize_migration()
+    by_name = {"happ android": 4, "xray default": 1}
+    ids = {1, 4}
+
+    canon = migration._canonicalize_response_type
+    # Built-ins and legacy config-format spellings
+    assert canon("links_base64", by_name, ids) == "XRAY_BASE64"
+    assert canon("clash_meta", by_name, ids) == "MIHOMO"
+    assert canon("xray_json", by_name, ids) == "XRAY_JSON"
+    assert canon("SOCKET_DROP", by_name, ids) == "SOCKET_DROP"
+    # Template references
+    assert canon("Happ Android", by_name, ids) == "TEMPLATE:4"
+    assert canon("TEMPLATE:4", by_name, ids) == "TEMPLATE:4"
+    assert canon("4", by_name, ids) == "TEMPLATE:4"
+    assert canon(4, by_name, ids) == "TEMPLATE:4"
+    # Unresolvable values are reported as such so the caller can leave them untouched
+    assert canon("Deleted Template", by_name, ids) is None
+    assert canon("99", by_name, ids) is None
+    assert canon("", by_name, ids) is None
+
+
+def test_migration_rewrite_rules_leaves_unresolvable_alone():
+    migration = _load_canonicalize_migration()
+    rules = [
+        {"name": "a", "responseType": "links_base64"},
+        {"name": "b", "responseType": "Happ Android"},
+        {"name": "c", "responseType": "Ghost Template"},
+        {"name": "d" * 80, "responseType": "CLASH"},
+    ]
+    changed = migration._rewrite_rules(rules, {"happ android": 4}, {4})
+
+    assert changed is True
+    assert rules[0]["responseType"] == "XRAY_BASE64"
+    assert rules[1]["responseType"] == "TEMPLATE:4"
+    assert rules[2]["responseType"] == "Ghost Template"
+    assert len(rules[3]["name"]) == 50
+
+    # Idempotent: a second pass changes nothing.
+    assert migration._rewrite_rules(rules, {"happ android": 4}, {4}) is False

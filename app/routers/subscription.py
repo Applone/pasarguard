@@ -54,6 +54,9 @@ async def user_subscription_headers(
         request_url=str(request.url),
         request=request,
     )
+    # Status-only response types and socket drop return a ready Response.
+    if isinstance(response_headers, Response):
+        return response_headers
     return Response(headers=response_headers)
 
 
