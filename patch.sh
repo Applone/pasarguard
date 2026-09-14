@@ -1,36 +1,37 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────
-#  patch.sh – Safely patch an existing PasarGuard installation to use
-#             the latest image from the Applone/pasarguard fork on GHCR.
+#  patch.sh – Safely patch or update a PasarGuard installation with
+#             the Applone/pasarguard fork from GHCR.
 #
 #  Usage:
-#    sudo bash patch.sh [OPTIONS]
+#    sudo bash patch.sh <patch|update> [OPTIONS]
+#
+#  Commands:
+#    patch                Replace an upstream PasarGuard with this fork
+#    update               Update an existing fork installation in-place
 #
 #  Options:
 #    --install-dir DIR    Application directory  (default: /opt/pasarguard)
 #    --data-dir DIR       Persistent data dir    (default: /var/lib/pasarguard)
-#    --tag TAG            Image tag to pull       (default: dev)
-#    --no-backup          Skip pre-patch backup
+#    --tag TAG            Image tag / branch      (default: dev)
+#    --no-backup          Skip pre-operation backup
 #    --dry-run            Show what would happen without making changes
 #    --yes                Skip confirmation prompts
 #    -h, --help           Show this help message
 #
-#  The script will:
-#    1. Detect the deployment type (Docker or bare-metal/systemd)
-#    2. Create a backup of the install directory and database
-#    3. Stop the running service
-#    4. Docker: swap the image to ghcr.io/applone/pasarguard and pull it
-#       Bare-metal: pull source from the fork via git
-#    5. Apply database migrations and sync dependencies (bare-metal)
-#    6. Restart the service
-#    7. Run a health check to verify the patch
+#  Examples:
+#    sudo bash patch.sh patch                # replace upstream with fork
+#    sudo bash patch.sh update               # pull latest fork image
+#    sudo bash patch.sh update --tag v5.3.0  # update to a specific tag
+#    bash patch.sh update --dry-run          # preview an update
 #
 #  Rollback: If any critical step fails, the script automatically
-#            restores from backup and restarts the original version.
+#            restores from backup and restarts the previous version.
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────────────
+MODE=""  # "patch" or "update"
 INSTALL_DIR="/opt/pasarguard"
 DATA_DIR="/var/lib/pasarguard"
 FORK_REPO="https://github.com/Applone/pasarguard.git"
@@ -66,8 +67,14 @@ usage() {
 }
 
 # ── Parse Arguments ──────────────────────────────────────────────────
+# First positional argument is the command
+if [[ ${1:-} == "patch" || ${1:-} == "update" ]]; then
+    MODE="$1"; shift
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        patch|update)    MODE="$1"; shift ;;
         --install-dir)   INSTALL_DIR="$2"; shift 2 ;;
         --data-dir)      DATA_DIR="$2"; shift 2 ;;
         --tag)           IMAGE_TAG="$2"; shift 2 ;;
@@ -78,6 +85,17 @@ while [[ $# -gt 0 ]]; do
         *)               die "Unknown option: $1. Use --help for usage." ;;
     esac
 done
+
+if [[ -z "$MODE" ]]; then
+    echo -e "${RED}Error: No command specified.${NC}"
+    echo -e "Usage: ${BOLD}sudo bash patch.sh <patch|update> [OPTIONS]${NC}"
+    echo ""
+    echo -e "  ${BOLD}patch${NC}   – Replace an upstream PasarGuard install with this fork"
+    echo -e "  ${BOLD}update${NC}  – Update an existing fork installation to the latest version"
+    echo ""
+    echo "Run with --help for all options."
+    exit 1
+fi
 
 # ── Derived Paths ────────────────────────────────────────────────────
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
@@ -127,7 +145,6 @@ detect_deploy_type() {
     fi
 }
 
-# Get the current image from docker-compose.yml
 get_current_image() {
     grep -E '^\s*image:' "$COMPOSE_FILE" 2>/dev/null | head -1 | sed 's/.*image:\s*//' | tr -d ' "'"'" || echo "unknown"
 }
@@ -137,6 +154,29 @@ get_current_commit() {
         git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown"
     else
         echo "unknown"
+    fi
+}
+
+get_current_branch() {
+    if [[ -d "${INSTALL_DIR}/.git" ]]; then
+        git -C "$INSTALL_DIR" branch --show-current 2>/dev/null || echo "unknown"
+    else
+        echo "unknown"
+    fi
+}
+
+# Check whether the install is already running the fork
+is_fork_install() {
+    if [[ "$DEPLOY_TYPE" == "docker" ]]; then
+        local img
+        img=$(get_current_image)
+        [[ "$img" == *"applone/pasarguard"* ]]
+    else
+        if [[ -d "${INSTALL_DIR}/.git" ]]; then
+            git -C "$INSTALL_DIR" remote -v 2>/dev/null | grep -qi "applone/pasarguard"
+        else
+            return 1
+        fi
     fi
 }
 
@@ -197,13 +237,12 @@ create_backup() {
 
     log_step "Creating backup"
     BACKUP_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-    BACKUP_DIR="${DATA_DIR}/backups/patch_${BACKUP_TIMESTAMP}"
+    BACKUP_DIR="${DATA_DIR}/backups/${MODE}_${BACKUP_TIMESTAMP}"
 
     if $DRY_RUN; then log_dry "Would create backup at ${BACKUP_DIR}"; return 0; fi
 
     mkdir -p "$BACKUP_DIR"
 
-    # Backup the install directory (exclude heavy generated dirs)
     log_info "Backing up ${INSTALL_DIR} → ${BACKUP_DIR}/app/"
     rsync -a \
         --exclude='.venv' \
@@ -215,18 +254,15 @@ create_backup() {
         cp -a "${INSTALL_DIR}" "${BACKUP_DIR}/app" 2>/dev/null || \
         die "Failed to backup install directory"
 
-    # Backup .env separately for easy access
     if [[ -f "$ENV_FILE" ]]; then
         cp -p "$ENV_FILE" "${BACKUP_DIR}/env.backup"
     fi
 
-    # Backup SQLite database if present
     if [[ -f "${INSTALL_DIR}/db.sqlite3" ]]; then
         log_info "Backing up SQLite database"
         cp -p "${INSTALL_DIR}/db.sqlite3" "${BACKUP_DIR}/db.sqlite3.backup"
     fi
 
-    # Record state for rollback
     if [[ "$DEPLOY_TYPE" == "docker" ]]; then
         echo "$ORIGINAL_IMAGE" > "${BACKUP_DIR}/original_image.txt"
     else
@@ -239,7 +275,7 @@ create_backup() {
 # ── Rollback ─────────────────────────────────────────────────────────
 
 rollback() {
-    log_error "Patch failed! Initiating rollback..."
+    log_error "${MODE^} failed! Initiating rollback..."
 
     if [[ -z "$BACKUP_DIR" ]] || [[ ! -d "${BACKUP_DIR}/app" ]]; then
         die "No backup available for rollback. Manual intervention required.
@@ -249,7 +285,6 @@ rollback() {
     log_step "Restoring from backup"
 
     if [[ "$DEPLOY_TYPE" == "docker" ]]; then
-        # Restore docker-compose.yml (which contains the original image)
         if [[ -f "${BACKUP_DIR}/app/docker-compose.yml" ]]; then
             cp -p "${BACKUP_DIR}/app/docker-compose.yml" "$COMPOSE_FILE"
             log_info "Restored original docker-compose.yml"
@@ -272,19 +307,20 @@ rollback() {
 
     log_success "Files restored from backup"
     start_service
-    log_warn "Rolled back to pre-patch state"
+    log_warn "Rolled back to pre-${MODE} state"
     exit 1
 }
 
-# ── Docker: Swap image and pull ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  PATCH MODE – replace upstream with fork
+# ══════════════════════════════════════════════════════════════════════
 
 patch_docker() {
     local new_image="${FORK_IMAGE}:${IMAGE_TAG}"
 
-    log_step "Updating Docker image to ${new_image}"
+    log_step "Switching Docker image to ${new_image}"
 
     if [[ "$ORIGINAL_IMAGE" == "$new_image" ]]; then
-        # Same image reference – just pull the latest digest
         log_info "Image reference is already ${new_image}. Pulling latest digest..."
         if $DRY_RUN; then log_dry "Would pull ${new_image}"; return 0; fi
 
@@ -299,12 +335,9 @@ patch_docker() {
         return 0
     fi
 
-    # Pull the new image first (fail early before touching config)
     log_info "Pulling ${new_image}..."
     docker pull "$new_image" || die "Failed to pull ${new_image}. Check that the image exists on GHCR."
 
-    # Replace the image in docker-compose.yml
-    # Use a temp file + mv for atomicity
     local tmp_compose
     tmp_compose=$(mktemp)
     sed "s|^\(\s*image:\s*\).*|\1${new_image}|" "$COMPOSE_FILE" > "$tmp_compose"
@@ -312,8 +345,6 @@ patch_docker() {
 
     log_success "docker-compose.yml updated: image → ${new_image}"
 }
-
-# ── Bare-metal: Git pull from fork ───────────────────────────────────
 
 patch_bare_metal() {
     log_step "Pulling latest source from fork (${IMAGE_TAG})"
@@ -327,10 +358,9 @@ patch_bare_metal() {
     require_cmd git "Install with: apt install git"
 
     if [[ ! -d ".git" ]]; then
-        die "${INSTALL_DIR} is not a git repository. Cannot patch bare-metal install without git."
+        die "${INSTALL_DIR} is not a git repository. Cannot patch without git."
     fi
 
-    # Add or update the fork remote
     local remote_name="applone-fork"
     if git remote get-url "$remote_name" &>/dev/null; then
         git remote set-url "$remote_name" "$FORK_REPO"
@@ -338,7 +368,6 @@ patch_bare_metal() {
         git remote add "$remote_name" "$FORK_REPO"
     fi
 
-    # Fetch
     log_info "Fetching from ${remote_name}..."
     git fetch "$remote_name" "$IMAGE_TAG" || die "Failed to fetch from fork."
 
@@ -352,7 +381,6 @@ patch_bare_metal() {
 
     log_info "Current: ${PRE_PATCH_COMMIT} → Target: ${target_commit}"
 
-    # Stash local changes
     local stash_needed=false
     if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
         log_warn "Local modifications detected – stashing"
@@ -368,6 +396,119 @@ patch_bare_metal() {
             log_warn "Could not auto-apply stashed changes. Check 'git stash list'."
     fi
 
+    bare_metal_post_update
+}
+
+# ══════════════════════════════════════════════════════════════════════
+#  UPDATE MODE – pull latest version of the fork
+# ══════════════════════════════════════════════════════════════════════
+
+update_docker() {
+    local current_image
+    current_image=$(get_current_image)
+
+    log_step "Pulling latest image for ${current_image}"
+
+    if $DRY_RUN; then
+        log_dry "Would pull ${current_image}"
+        return 0
+    fi
+
+    # Record the old image digest for comparison
+    local old_digest
+    old_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$current_image" 2>/dev/null || echo "unknown")
+
+    docker pull "$current_image" || die "Failed to pull ${current_image}"
+
+    local new_digest
+    new_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$current_image" 2>/dev/null || echo "unknown")
+
+    if [[ "$old_digest" == "$new_digest" ]] && [[ "$old_digest" != "unknown" ]]; then
+        log_success "Already running the latest image (digest unchanged)"
+    else
+        log_success "Pulled new image for ${current_image}"
+    fi
+}
+
+update_bare_metal() {
+    log_step "Pulling latest changes"
+
+    if $DRY_RUN; then
+        log_dry "Would pull latest changes on current branch"
+        return 0
+    fi
+
+    cd "$INSTALL_DIR"
+    require_cmd git "Install with: apt install git"
+
+    if [[ ! -d ".git" ]]; then
+        die "${INSTALL_DIR} is not a git repository. Cannot update without git."
+    fi
+
+    local current_branch
+    current_branch=$(get_current_branch)
+
+    # Determine the right remote to pull from
+    local remote_name
+    if git remote get-url "applone-fork" &>/dev/null 2>&1; then
+        remote_name="applone-fork"
+    elif git remote get-url "origin" &>/dev/null 2>&1; then
+        remote_name="origin"
+    else
+        die "No git remote found to pull updates from."
+    fi
+
+    # Use --tag as the branch if it differs from current
+    local target_branch="$IMAGE_TAG"
+    if [[ "$current_branch" != "unknown" ]] && [[ "$target_branch" == "dev" ]]; then
+        # Default tag "dev" – use the current branch if already on a fork branch
+        target_branch="$current_branch"
+    fi
+
+    log_info "Remote: ${remote_name} | Branch: ${target_branch}"
+
+    git fetch "$remote_name" "$target_branch" || die "Failed to fetch from ${remote_name}."
+
+    local target_commit
+    target_commit=$(git rev-parse --short "${remote_name}/${target_branch}" 2>/dev/null || \
+                    git rev-parse --short "FETCH_HEAD")
+
+    if [[ "$PRE_PATCH_COMMIT" == "$target_commit" ]]; then
+        log_success "Already up-to-date (${target_commit}). Nothing to update."
+        exit 0
+    fi
+
+    log_info "Current: ${PRE_PATCH_COMMIT} → Target: ${target_commit}"
+
+    local stash_needed=false
+    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+        log_warn "Local modifications detected – stashing"
+        git stash push -m "patch.sh update auto-stash $(date +%Y%m%d_%H%M%S)" --include-untracked
+        stash_needed=true
+    fi
+
+    # Fast-forward merge if possible, otherwise reset
+    if git merge --ff-only "${remote_name}/${target_branch}" 2>/dev/null; then
+        log_success "Fast-forward merge to ${target_commit}"
+    else
+        log_warn "Cannot fast-forward; resetting branch to ${remote_name}/${target_branch}"
+        git reset --hard "${remote_name}/${target_branch}"
+        log_success "Reset to ${target_commit}"
+    fi
+
+    if $stash_needed; then
+        git stash pop 2>/dev/null || \
+            log_warn "Could not auto-apply stashed changes. Check 'git stash list'."
+    fi
+
+    bare_metal_post_update
+}
+
+# ══════════════════════════════════════════════════════════════════════
+#  SHARED: bare-metal post-update steps
+# ══════════════════════════════════════════════════════════════════════
+
+bare_metal_post_update() {
     # Sync Python dependencies
     log_step "Syncing Python dependencies"
     if ! command -v uv &>/dev/null; then
@@ -497,8 +638,15 @@ run_health_check() {
 # ══════════════════════════════════════════════════════════════════════
 
 main() {
+    local banner_verb
+    if [[ "$MODE" == "patch" ]]; then
+        banner_verb="Patch"
+    else
+        banner_verb="Update"
+    fi
+
     echo -e "\n${BOLD}╔══════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║     PasarGuard Fork Patch Script             ║${NC}"
+    echo -e "${BOLD}║     PasarGuard Fork ${banner_verb} Script           ║${NC}"
     echo -e "${BOLD}║     ghcr.io/applone/pasarguard               ║${NC}"
     echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}\n"
 
@@ -518,6 +666,16 @@ main() {
     require_cmd curl "Install with: apt install curl"
 
     detect_deploy_type
+
+    # Mode-specific validation
+    if [[ "$MODE" == "update" ]]; then
+        if ! is_fork_install; then
+            die "This installation does not appear to be running the Applone fork.
+    Use '${0} patch' first to switch from upstream to the fork."
+        fi
+    fi
+
+    log_info "Mode:               ${MODE}"
     log_info "Install directory:  ${INSTALL_DIR}"
     log_info "Data directory:     ${DATA_DIR}"
     log_info "Deploy type:        ${DEPLOY_TYPE}"
@@ -525,11 +683,18 @@ main() {
     if [[ "$DEPLOY_TYPE" == "docker" ]]; then
         ORIGINAL_IMAGE=$(get_current_image)
         log_info "Current image:      ${ORIGINAL_IMAGE}"
-        log_info "Target image:       ${FORK_IMAGE}:${IMAGE_TAG}"
+        if [[ "$MODE" == "patch" ]]; then
+            log_info "Target image:       ${FORK_IMAGE}:${IMAGE_TAG}"
+        fi
     else
         PRE_PATCH_COMMIT=$(get_current_commit)
+        local current_branch
+        current_branch=$(get_current_branch)
         log_info "Current commit:     ${PRE_PATCH_COMMIT}"
-        log_info "Fork branch:        ${IMAGE_TAG}"
+        log_info "Current branch:     ${current_branch}"
+        if [[ "$MODE" == "patch" ]]; then
+            log_info "Target branch:      ${IMAGE_TAG}"
+        fi
     fi
 
     if $DRY_RUN; then
@@ -537,7 +702,11 @@ main() {
     fi
 
     echo ""
-    confirm "Apply the Applone/pasarguard fork patch?"
+    if [[ "$MODE" == "patch" ]]; then
+        confirm "Patch this PasarGuard installation with the Applone fork?"
+    else
+        confirm "Update this PasarGuard fork installation to the latest version?"
+    fi
 
     # ── Set rollback trap ────────────────────────────────────────────
     if ! $DRY_RUN; then
@@ -548,10 +717,18 @@ main() {
     create_backup
     stop_service
 
-    if [[ "$DEPLOY_TYPE" == "docker" ]]; then
-        patch_docker
+    if [[ "$MODE" == "patch" ]]; then
+        if [[ "$DEPLOY_TYPE" == "docker" ]]; then
+            patch_docker
+        else
+            patch_bare_metal
+        fi
     else
-        patch_bare_metal
+        if [[ "$DEPLOY_TYPE" == "docker" ]]; then
+            update_docker
+        else
+            update_bare_metal
+        fi
     fi
 
     check_new_env_keys
@@ -563,28 +740,38 @@ main() {
     run_health_check
 
     # ── Summary ──────────────────────────────────────────────────────
+    local done_label
+    if [[ "$MODE" == "patch" ]]; then
+        done_label="Patch applied successfully! ✓"
+    else
+        done_label="Update applied successfully! ✓"
+    fi
+
     echo -e "\n${BOLD}${GREEN}╔══════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${GREEN}║         Patch applied successfully! ✓        ║${NC}"
+    printf "${BOLD}${GREEN}║  %-43s ║${NC}\n" "$done_label"
     echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════╝${NC}\n"
 
     if [[ "$DEPLOY_TYPE" == "docker" ]]; then
         echo -e "  ${BOLD}Before:${NC}  ${ORIGINAL_IMAGE}"
-        echo -e "  ${BOLD}After:${NC}   ${FORK_IMAGE}:${IMAGE_TAG}"
+        if [[ "$MODE" == "patch" ]]; then
+            echo -e "  ${BOLD}After:${NC}   ${FORK_IMAGE}:${IMAGE_TAG}"
+        else
+            echo -e "  ${BOLD}After:${NC}   $(get_current_image) (latest digest)"
+        fi
     else
         local new_commit
         new_commit=$(get_current_commit)
         echo -e "  ${BOLD}Before:${NC}  ${PRE_PATCH_COMMIT}"
         echo -e "  ${BOLD}After:${NC}   ${new_commit}"
-        echo -e "  ${BOLD}Branch:${NC}  patched-${IMAGE_TAG}"
+        echo -e "  ${BOLD}Branch:${NC}  $(get_current_branch)"
     fi
 
     if [[ -n "$BACKUP_DIR" ]] && [[ -d "$BACKUP_DIR" ]]; then
         echo -e "  ${BOLD}Backup:${NC}  ${BACKUP_DIR}"
     fi
 
-    echo -e "\n  To revert this patch:"
+    echo -e "\n  To revert:"
     if [[ "$DEPLOY_TYPE" == "docker" ]]; then
-        echo -e "    Restore ${BACKUP_DIR}/app/docker-compose.yml and restart:"
         echo -e "    cp ${BACKUP_DIR}/app/docker-compose.yml ${COMPOSE_FILE}"
         echo -e "    docker compose -f ${COMPOSE_FILE} -p ${SERVICE_NAME} up -d"
     else
