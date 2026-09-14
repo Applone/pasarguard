@@ -272,7 +272,30 @@ export const defaultSubscriptionRules: SubscriptionRuleFormData[] = [
     },
   },
   {
-    name: 'Xray / InHive / V2Ray',
+    name: 'V2Ray (v2rayN / v2rayNG)',
+    description: 'Serve share links configuration',
+    enabled: true,
+    operator: 'AND',
+    conditions: [
+      {
+        headerName: 'user-agent',
+        operator: 'REGEX',
+        value: '^([Vv]2rayNG|[Vv]2rayN)',
+        caseSensitive: true,
+      },
+    ],
+    responseType: 'LINKS',
+    responseModifications: {
+      subscriptionTemplate: null,
+      headers: [],
+      applyHeadersToEnd: false,
+      ignoreHostXrayJsonTemplate: false,
+      ignoreServeJsonAtBaseSubscription: false,
+      disableHwidCheck: false,
+    },
+  },
+  {
+    name: 'Xray / Happ / Streisand',
     description: 'Serve Xray JSON configuration',
     enabled: true,
     operator: 'AND',
@@ -280,7 +303,7 @@ export const defaultSubscriptionRules: SubscriptionRuleFormData[] = [
       {
         headerName: 'user-agent',
         operator: 'REGEX',
-        value: '^[Ii]n[Hh]ive|^([Vv]2rayNG|[Vv]2rayN|[Ss]treisand|[Hh]app|[Kk]tor\\-client)',
+        value: '^([Ss]treisand|[Hh]app|[Kk]tor\\-client)',
         caseSensitive: true,
       },
     ],

@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime as dt
 from json import dumps as json_dumps
 from typing import Any, ClassVar, Literal
 
@@ -34,6 +35,7 @@ from app.models.stats import UserUsageStatsList
 from app.models.subscription import SubscriptionUsageQuery
 from app.models.user import SubscriptionUserResponse, UsersResponseWithInbounds
 from app.settings import hwid_settings, subscription_settings
+from app.subscription import sub_update_buffer as _sub_update_buffer  # noqa: F401  # registers per-worker flush loop
 from app.subscription.client_templates import resolve_client_template_content, resolve_response_template
 from app.subscription.share import (
     apply_custom_format_variables,
@@ -275,6 +277,18 @@ async def resolve_rule_response(rule: SubRule) -> ResolvedRuleResponse:
 
 class SubscriptionOperation(BaseOperation):
     _ENCODED_RULE_RESPONSE_HEADERS: ClassVar[set[str]] = {"announce", "profile-title"}
+    _SUB_CONFIG_LOAD: ClassVar[dict[str, bool]] = {
+        "load_next_plan": False,
+        "load_usage_logs": False,
+        "load_groups": False,
+        "load_lifetime_used_traffic": True,
+    }
+    _SUB_INFO_LOAD: ClassVar[dict[str, bool]] = {
+        "load_next_plan": True,
+        "load_usage_logs": False,
+        "load_groups": True,
+        "load_lifetime_used_traffic": True,
+    }
 
     @staticmethod
     async def validated_user(db_user: User) -> UsersResponseWithInbounds:
@@ -391,6 +405,7 @@ class SubscriptionOperation(BaseOperation):
         }
         if extra_headers:
             headers.update(extra_headers)
+        headers["Cache-Control"] = "no-store"
         return headers
 
     @classmethod
@@ -610,6 +625,11 @@ class SubscriptionOperation(BaseOperation):
 
         existing_hwid = await get_user_hwid_by_value(db, user_id, x_hwid)
         if existing_hwid:
+            last_used = existing_hwid.last_used_at
+            if last_used is not None and last_used.tzinfo is None:
+                last_used = last_used.replace(tzinfo=UTC)
+            if last_used is not None and (dt.now(UTC) - last_used).total_seconds() < 300:
+                return
             await register_user_hwid(db, user_id, x_hwid, x_device_os, x_ver_os, x_device_model)
             return
 
@@ -640,7 +660,7 @@ class SubscriptionOperation(BaseOperation):
         Provides a subscription link based on request headers (Remnawave SSR) or user agent.
         """
         sub_settings: SubSettings = await subscription_settings()
-        db_user = await self.get_validated_sub(db, token, load_admin_role=True)
+        db_user = await self.get_validated_sub(db, token, load_admin_role=True, **self._SUB_CONFIG_LOAD)
         role_hwid_settings = db_user.admin.role.hwid if db_user.admin and db_user.admin.role else None
         user = await self.validated_user(db_user)
 
@@ -826,7 +846,7 @@ class SubscriptionOperation(BaseOperation):
 
         if client_type == ConfigFormat.block or not getattr(sub_settings.manual_sub_request, client_type):
             await self.raise_error(message="Client not supported", code=406)
-        db_user = await self.get_validated_sub(db, token=token, load_admin_role=True)
+        db_user = await self.get_validated_sub(db, token=token, load_admin_role=True, **self._SUB_CONFIG_LOAD)
         user = await self.validated_user(db_user)
 
         await self.validate_and_register_hwid(
@@ -898,7 +918,7 @@ class SubscriptionOperation(BaseOperation):
 
     async def user_subscription_raw(self, db: AsyncSession, token: str, request_url: str = ""):
         sub_settings: SubSettings = await subscription_settings()
-        db_user = await self.get_validated_sub(db, token, load_admin_role=True)
+        db_user = await self.get_validated_sub(db, token, load_admin_role=True, **self._SUB_CONFIG_LOAD)
         user = await self.validated_user(db_user)
         is_hwid_enabled = await self.is_user_hwid_enabled(db_user)
 
@@ -968,7 +988,7 @@ class SubscriptionOperation(BaseOperation):
     ) -> tuple[SubscriptionUserResponse, dict]:
         """Retrieves detailed information about the user's subscription."""
         sub_settings: SubSettings = await subscription_settings()
-        db_user = await self.get_validated_sub(db, token=token)
+        db_user = await self.get_validated_sub(db, token=token, **self._SUB_INFO_LOAD)
         user = await self.validated_user(db_user)
 
         response_headers = self.create_info_response_headers(user, sub_settings)
@@ -985,7 +1005,7 @@ class SubscriptionOperation(BaseOperation):
         """
         Get available applications for user's subscription.
         """
-        db_user = await self.get_validated_sub(db, token=token, load_admin_role=True)
+        db_user = await self.get_validated_sub(db, token=token, load_admin_role=True, **self._SUB_CONFIG_LOAD)
         user = await self.validated_user(db_user)
         is_hwid_enabled = await self.is_user_hwid_enabled(db_user)
         sub_settings: SubSettings = await subscription_settings()
@@ -1029,7 +1049,7 @@ class SubscriptionOperation(BaseOperation):
         response types and socket drop), otherwise a header map for the caller to attach.
         """
         sub_settings: SubSettings = await subscription_settings()
-        db_user = await self.get_validated_sub(db, token, load_admin_role=True)
+        db_user = await self.get_validated_sub(db, token, load_admin_role=True, **self._SUB_CONFIG_LOAD)
         user = await self.validated_user(db_user)
 
         headers_map: dict[str, str] = {}
@@ -1115,6 +1135,13 @@ class SubscriptionOperation(BaseOperation):
         """Fetches the usage statistics for the user within a specified date range."""
         start, end = await self.validate_dates(query.start, query.end, True)
 
-        db_user = await self.get_validated_sub(db, token=token)
+        db_user = await self.get_validated_sub(
+            db,
+            token=token,
+            load_admin=False,
+            load_next_plan=False,
+            load_usage_logs=False,
+            load_groups=False,
+        )
 
         return await get_user_usages(db, db_user.id, start, end, query.period)
