@@ -7,6 +7,7 @@ import { FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/comp
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import { cn } from '@/lib/utils'
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { GripVertical, Settings2, Trash2 } from 'lucide-react'
@@ -112,24 +113,13 @@ export function SortableSubscriptionRule({ index, onRemove, form, id }: Sortable
                   render={({ field }) => (
                     <FormItem className="min-w-0 flex-1 space-y-0 sm:w-[14rem] sm:shrink-0">
                       <FormLabel className="sr-only">Response Type</FormLabel>
-                      <Select onValueChange={field.onChange} value={field.value || 'XRAY_BASE64'}>
+                      <Select onValueChange={field.onChange} value={selectedOption?.value ?? field.value ?? ''}>
                         <FormControl>
                           <SelectTrigger dir="ltr" className="border-muted bg-background/60 focus:bg-background h-8 w-full min-w-0 px-2.5 text-[11px] sm:h-8 sm:px-3 sm:text-xs">
-                            <SelectValue />
+                            <SelectValue placeholder={t('settings.subscriptions.rules.selectResponseType', { defaultValue: 'Select a response type' })} />
                           </SelectTrigger>
                         </FormControl>
                         <SelectContent dir="ltr" className="z-[50] max-h-72 scrollbar-thin">
-                          <SelectGroup>
-                            <SelectLabel className="text-[10px] tracking-wide uppercase">{t('settings.subscriptions.rules.builtinTypes', { defaultValue: 'Built-in' })}</SelectLabel>
-                            {builtins.map(option => (
-                              <SelectItem key={option.value} value={option.value}>
-                                <div className="flex items-center gap-1.5">
-                                  <option.icon className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
-                                  <span className="text-xs">{option.label}</span>
-                                </div>
-                              </SelectItem>
-                            ))}
-                          </SelectGroup>
                           {templates.length > 0 && (
                             <SelectGroup>
                               <SelectLabel className="text-[10px] tracking-wide uppercase">{t('settings.subscriptions.rules.clientTemplates', { defaultValue: 'Client Templates' })}</SelectLabel>
@@ -143,16 +133,27 @@ export function SortableSubscriptionRule({ index, onRemove, form, id }: Sortable
                               ))}
                             </SelectGroup>
                           )}
-                          {/* A rule may point at a template that has since been deleted. Keep the
-                              value selectable so the select is not silently blank. */}
-                          {selectedOption?.missing && (
-                            <SelectGroup>
-                              <SelectLabel className="text-destructive text-[10px] tracking-wide uppercase">
-                                {t('settings.subscriptions.rules.missingTemplate', { defaultValue: 'Missing template' })}
-                              </SelectLabel>
-                              <SelectItem value={selectedOption.value}>
+                          <SelectGroup>
+                            <SelectLabel className="text-[10px] tracking-wide uppercase">{t('settings.subscriptions.rules.builtinTypes', { defaultValue: 'Built-in' })}</SelectLabel>
+                            {builtins.map(option => (
+                              <SelectItem key={option.value} value={option.value}>
                                 <div className="flex items-center gap-1.5">
-                                  <selectedOption.icon className="text-destructive h-3.5 w-3.5 shrink-0" />
+                                  <option.icon className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
+                                  <span className="text-xs">{option.label}</span>
+                                </div>
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                          {(selectedOption?.missing || selectedOption?.legacy) && (
+                            <SelectGroup>
+                              <SelectLabel className={cn('text-[10px] tracking-wide uppercase', selectedOption.missing && 'text-destructive')}>
+                                {selectedOption.missing
+                                  ? t('settings.subscriptions.rules.missingTemplate', { defaultValue: 'Missing template' })
+                                  : t('settings.subscriptions.rules.legacyResponse', { defaultValue: 'Current response (legacy)' })}
+                              </SelectLabel>
+                              <SelectItem value={selectedOption.value} disabled={selectedOption.legacy}>
+                                <div className="flex items-center gap-1.5">
+                                  <selectedOption.icon className={cn('h-3.5 w-3.5 shrink-0', selectedOption.missing ? 'text-destructive' : 'text-muted-foreground')} />
                                   <span className="text-xs">{selectedOption.label}</span>
                                 </div>
                               </SelectItem>

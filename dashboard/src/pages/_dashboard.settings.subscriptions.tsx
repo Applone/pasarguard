@@ -1,4 +1,5 @@
 import { buildDefaultApplications } from '@/features/subscriptions/components/default-applications-catalog'
+import { useResponseTypeOptions } from '@/features/subscriptions/components/config-format-options'
 import { SubscriptionApplicationSheet } from '@/features/subscriptions/components/subscription-application-sheet'
 import { SubscriptionApplicationsSection } from '@/features/subscriptions/components/subscription-applications-section'
 import { SubscriptionCustomVariablesSection } from '@/features/subscriptions/components/subscription-custom-variables-section'
@@ -17,12 +18,12 @@ import {
 } from '@/features/subscriptions/components/subscription-settings-schema'
 import { Form } from '@/components/ui/form'
 import { Separator } from '@/components/ui/separator'
-import { type SubRule as ApiSubRule } from '@/service/api'
+import { type SubRuleOutput as ApiSubRule, type SubscriptionOutput } from '@/service/api'
 import { DragEndEvent, KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useEffect, useState } from 'react'
-import { FieldErrors, useFieldArray, useForm } from 'react-hook-form'
+import { FieldErrors, type Resolver, useFieldArray, useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { useSettingsContext } from './_dashboard.settings'
@@ -31,9 +32,10 @@ export default function SubscriptionSettings() {
   const { t } = useTranslation()
   const { settings, isLoading, error, updateSettings, isSaving } = useSettingsContext()
   const [isAddAppOpen, setIsAddAppOpen] = useState(false)
+  const { defaultResponseType } = useResponseTypeOptions()
 
   const form = useForm<SubscriptionFormData>({
-    resolver: zodResolver(subscriptionSchema),
+    resolver: zodResolver(subscriptionSchema) as Resolver<SubscriptionFormData>,
     defaultValues: {
       url_prefix: '',
       update_interval: 24,
@@ -117,7 +119,7 @@ export default function SubscriptionSettings() {
 
   useEffect(() => {
     if (settings?.subscription) {
-      const subscriptionData = settings.subscription
+      const subscriptionData: SubscriptionOutput = settings.subscription
       form.reset({
         url_prefix: subscriptionData.url_prefix || '',
         update_interval: subscriptionData.update_interval || 24,
@@ -134,11 +136,11 @@ export default function SubscriptionSettings() {
           subscriptionData.rules?.map((rule: ApiSubRule) => {
             let conditions = rule.conditions || []
             let responseType = rule.responseType
-            const legacyTarget = (rule as any).target
-            const legacyPattern = (rule as any).pattern
+            const legacyTarget = rule.target
+            const legacyPattern = rule.pattern
 
-            if ((!responseType || (responseType as string) === '') && legacyTarget) {
-              const map: Record<string, any> = {
+            if (!responseType && legacyTarget) {
+              const map: Record<string, string> = {
                 clash_meta: 'MIHOMO',
                 clash: 'CLASH',
                 sing_box: 'SINGBOX',
@@ -165,14 +167,14 @@ export default function SubscriptionSettings() {
 
             const mods = rule.responseModifications || {}
             let rawHeaders = mods.headers
-            if (!rawHeaders && (rule as any).response_headers) {
-              rawHeaders = (rule as any).response_headers
+            if (!rawHeaders && rule.response_headers) {
+              rawHeaders = rule.response_headers
             }
             let headerItems: { key: string; value: string }[] = []
             if (Array.isArray(rawHeaders)) {
-              headerItems = rawHeaders.map(h => ({
-                key: (h as any).key || '',
-                value: typeof (h as any).value === 'string' ? (h as any).value : JSON.stringify((h as any).value ?? ''),
+              headerItems = rawHeaders.map(header => ({
+                key: header.key || '',
+                value: typeof header.value === 'string' ? header.value : JSON.stringify(header.value ?? ''),
               }))
             } else if (rawHeaders && typeof rawHeaders === 'object') {
               headerItems = Object.entries(rawHeaders).map(([k, v]) => ({
@@ -185,14 +187,14 @@ export default function SubscriptionSettings() {
               name: rule.name || (rule.conditions?.[0]?.value ? `Rule: ${rule.conditions[0].value}` : 'Rule'),
               description: rule.description || '',
               enabled: rule.enabled ?? true,
-              operator: (rule.operator as 'AND' | 'OR') || 'AND',
-              conditions: conditions.map(c => ({
-                headerName: c.headerName || 'user-agent',
-                operator: (c.operator as any) || 'CONTAINS',
-                value: c.value || '',
-                caseSensitive: c.caseSensitive ?? false,
+              operator: rule.operator || 'AND',
+              conditions: conditions.map(condition => ({
+                headerName: condition.headerName || 'user-agent',
+                operator: condition.operator || 'CONTAINS',
+                value: condition.value || '',
+                caseSensitive: condition.caseSensitive ?? false,
               })),
-              responseType: (responseType as any) || 'XRAY_BASE64',
+              responseType: responseType || 'XRAY_BASE64',
               responseModifications: {
                 subscriptionTemplate: mods.subscriptionTemplate || null,
                 headers: headerItems,
@@ -355,37 +357,7 @@ export default function SubscriptionSettings() {
 
   const handleCancel = () => {
     if (settings?.subscription) {
-      const subscriptionData = settings.subscription
-      form.reset({
-        url_prefix: subscriptionData.url_prefix || '',
-        update_interval: subscriptionData.update_interval || 24,
-        support_url: subscriptionData.support_url || '',
-        profile_title: subscriptionData.profile_title || '',
-        announce: subscriptionData.announce || '',
-        announce_url: subscriptionData.announce_url || '',
-        allow_browser_config: subscriptionData.allow_browser_config ?? true,
-        disable_sub_template: subscriptionData.disable_sub_template ?? false,
-        randomize_order: subscriptionData.randomize_order ?? false,
-        custom_variables: subscriptionData.custom_variables || [],
-        response_headers: Object.fromEntries(Object.entries(subscriptionData.response_headers || {}).map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)])),
-        rules:
-          subscriptionData.rules?.map((rule: ApiSubRule) => ({
-            pattern: rule.pattern,
-            target: rule.target,
-            response_headers: Object.fromEntries(Object.entries(rule.response_headers || {}).map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)])),
-          })) || [],
-        applications: subscriptionData.applications || [],
-        manual_sub_request: {
-          links: subscriptionData.manual_sub_request?.links ?? true,
-          links_base64: subscriptionData.manual_sub_request?.links_base64 ?? true,
-          xray: subscriptionData.manual_sub_request?.xray ?? true,
-          wireguard: subscriptionData.manual_sub_request?.wireguard ?? true,
-          sing_box: subscriptionData.manual_sub_request?.sing_box ?? true,
-          clash: subscriptionData.manual_sub_request?.clash ?? true,
-          clash_meta: subscriptionData.manual_sub_request?.clash_meta ?? true,
-          outline: subscriptionData.manual_sub_request?.outline ?? true,
-        },
-      })
+      form.reset()
       toast.success(t('settings.subscriptions.cancelSuccess'))
     }
   }
@@ -419,7 +391,7 @@ export default function SubscriptionSettings() {
           caseSensitive: false,
         },
       ],
-      responseType: 'XRAY_BASE64',
+      responseType: defaultResponseType,
       responseModifications: {
         subscriptionTemplate: null,
         headers: [],

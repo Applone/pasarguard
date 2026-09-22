@@ -1,7 +1,7 @@
 import { AlertCircle, Cat, CircleOff, Code, FileCode2, Globe, GlobeLock, ListTree, ShieldAlert, TriangleAlert, Unplug } from 'lucide-react'
 import { type ComponentType, useMemo } from 'react'
 import { WireguardIcon, XrayIcon, SingboxIcon, MihomoIcon } from '@/components/icons/format-icons'
-import { useGetClientTemplatesSimple } from '@/service/api'
+import { type ClientTemplatesSimpleResponse, useGetClientTemplatesSimple } from '@/service/api'
 
 /**
  * Both lucide icons and the local SVG format icons accept `className`, which is all the
@@ -49,16 +49,19 @@ export interface ResponseTypeOption {
   icon: ResponseTypeIcon
   /** Present only for template-backed options. */
   templateType?: string
+  isDefault?: boolean
   missing?: boolean
+  legacy?: boolean
 }
 
-/**
- * The built-in response types.
- *
- * These are generators and terminal behaviors, not templates — the selectable set is
- * these plus every Client Template, assembled by `useResponseTypeOptions`.
- */
 export const builtinResponseTypeOptions: ResponseTypeOption[] = [
+  { value: 'BLOCK', label: 'Block (403 Forbidden)', icon: CircleOff },
+  { value: 'STATUS_CODE_404', label: 'HTTP 404 Not Found', icon: AlertCircle },
+  { value: 'STATUS_CODE_451', label: 'HTTP 451 Legal Reasons', icon: ShieldAlert },
+  { value: 'SOCKET_DROP', label: 'Socket Drop (Disconnect)', icon: Unplug },
+]
+
+const legacyResponseTypeOptions: ResponseTypeOption[] = [
   { value: 'MIHOMO', label: 'Mihomo / Clash Meta', icon: MihomoIcon },
   { value: 'CLASH', label: 'Clash', icon: Cat },
   { value: 'STASH', label: 'Stash', icon: Cat },
@@ -69,13 +72,9 @@ export const builtinResponseTypeOptions: ResponseTypeOption[] = [
   { value: 'WIREGUARD', label: 'WireGuard', icon: WireguardIcon },
   { value: 'OUTLINE', label: 'Outline / Shadowsocks', icon: GlobeLock },
   { value: 'BROWSER', label: 'Web Browser Page', icon: Globe },
-  { value: 'BLOCK', label: 'Block (403 Forbidden)', icon: CircleOff },
-  { value: 'STATUS_CODE_404', label: 'HTTP 404 Not Found', icon: AlertCircle },
-  { value: 'STATUS_CODE_451', label: 'HTTP 451 Legal Reasons', icon: ShieldAlert },
-  { value: 'SOCKET_DROP', label: 'Socket Drop (Disconnect)', icon: Unplug },
 ]
 
-const BUILTIN_RESPONSE_TYPE_VALUES = new Set(builtinResponseTypeOptions.map(option => option.value))
+const BUILTIN_RESPONSE_TYPE_VALUES = new Set([...builtinResponseTypeOptions, ...legacyResponseTypeOptions].map(option => option.value))
 
 export const isBuiltinResponseType = (value?: string | null): boolean => !!value && BUILTIN_RESPONSE_TYPE_VALUES.has(value.trim().toUpperCase())
 
@@ -90,10 +89,10 @@ export const responseTemplateReference = (value?: string | null): string | null 
 }
 
 export interface UseResponseTypeOptionsResult {
-  /** Built-ins followed by every selectable Client Template. */
   options: ResponseTypeOption[]
   builtins: ResponseTypeOption[]
   templates: ResponseTypeOption[]
+  defaultResponseType: string
   /** Resolve a stored value to an option, synthesizing a placeholder if it is missing. */
   resolve: (value?: string | null) => ResponseTypeOption | undefined
   isLoading: boolean
@@ -105,7 +104,7 @@ export interface UseResponseTypeOptionsResult {
  * template in Client Templates immediately makes it selectable here.
  */
 export const useResponseTypeOptions = (enabled = true): UseResponseTypeOptionsResult => {
-  const { data, isLoading } = useGetClientTemplatesSimple({ all: true }, { query: { enabled } })
+  const { data, isLoading } = useGetClientTemplatesSimple<ClientTemplatesSimpleResponse>({ all: true }, { query: { enabled } })
 
   const templates = useMemo<ResponseTypeOption[]>(() => {
     const rows = data?.templates ?? []
@@ -116,13 +115,16 @@ export const useResponseTypeOptions = (enabled = true): UseResponseTypeOptionsRe
         label: template.name,
         icon: TEMPLATE_TYPE_ICONS[template.template_type] ?? FileCode2,
         templateType: template.template_type,
+        isDefault: template.is_default,
       }))
   }, [data?.templates])
 
-  const options = useMemo(() => [...builtinResponseTypeOptions, ...templates], [templates])
+  const options = useMemo(() => [...templates, ...builtinResponseTypeOptions], [templates])
+  const defaultResponseType =
+    templates.find(option => option.templateType === 'xray_subscription' && option.isDefault)?.value ?? templates.find(option => option.isDefault)?.value ?? templates[0]?.value ?? ''
 
   const resolve = useMemo(() => {
-    const byValue = new Map(options.map(option => [option.value, option]))
+    const byValue = new Map([...options, ...legacyResponseTypeOptions.map(option => ({ ...option, legacy: true }))].map(option => [option.value, option]))
     const byName = new Map(templates.map(option => [option.label.toLowerCase(), option]))
 
     return (value?: string | null): ResponseTypeOption | undefined => {
@@ -148,7 +150,7 @@ export const useResponseTypeOptions = (enabled = true): UseResponseTypeOptionsRe
     }
   }, [options, templates])
 
-  return { options, builtins: builtinResponseTypeOptions, templates, resolve, isLoading }
+  return { options, builtins: builtinResponseTypeOptions, templates, defaultResponseType, resolve, isLoading }
 }
 
 export const templateTypeLabel = (templateType?: string): string | undefined => (templateType ? TEMPLATE_TYPE_LABELS[templateType] : undefined)
